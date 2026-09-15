@@ -1,8 +1,12 @@
 /**
  * Production embedder: loads an application-owned bundle and executes
  * bundled WASM capabilities directly in the browser's native WebAssembly
- * host — no `traverse-cli serve`, no server round trip, no nested WASM
- * engine (spec 068 FR-002).
+ * host — no `traverse-cli serve`, no server round trip.
+ *
+ * This is the current (interim) architecture pending
+ * `1402-runtime-wasm-orchestrator-convergence`'s Phase 3 (`#1408`), which
+ * will replace it with a compiled `runtime.wasm` orchestrator; see
+ * ADR-0072 for the full rationale.
  *
  * Where the native Rust `traverse-embedder` crate embeds Wasmtime to run
  * bundled capability artifacts, the browser *is already* a WebAssembly
