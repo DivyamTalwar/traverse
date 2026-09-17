@@ -848,7 +848,12 @@ fn bridge_reports_ollama_provider_execution_failure_with_evidence() {
         json!({"models": [{"name": "llama3.2:3b"}]}).to_string(),
         json!({"model": "llama3.2:3b", "done": true}).to_string(),
     ]);
-    let dependency = model_dependency(vec![model_candidate("bad-generate", "llama3.2:3b", 20, 8192)]);
+    let dependency = model_dependency(vec![model_candidate(
+        "bad-generate",
+        "llama3.2:3b",
+        20,
+        8192,
+    )]);
     let activated: BTreeSet<(String, String)> = BTreeSet::new();
 
     let error = execute_governed_bridged_model_dependency(
