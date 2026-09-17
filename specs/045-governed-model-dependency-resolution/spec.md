@@ -2,7 +2,7 @@
 
 **Feature Branch**: `045-governed-model-dependency-resolution`
 **Created**: 2026-06-12
-**Status**: Approved
+**Status**: Approved — `exact-ref.wasm-cpu` candidate kind amend approved 2026-09-17
 **Input**: Downstream knowledge-app MVP requirements and Traverse team approval decisions from 2026-06-12. Model inference must be real, not placeholder behavior. Model dependencies are selectable candidates declared by the app manifest, resolved by Traverse using availability, basic model fit, and app priority.
 
 ## Purpose
@@ -92,16 +92,19 @@ As a UI or auditor, I want public trace evidence to show which model/provider wa
 
 - **FR-001**: Traverse MUST define a governed model dependency declaration for app manifests containing at minimum: `interface_id`, `version_range`, `selection_policy`, `required_capabilities`, `minimum_context_window`, and `candidates`.
 - **FR-002**: Each model candidate MUST declare at minimum: candidate id, provider capability id, provider implementation id, model identifier, placement target, priority, required provider config keys, and non-sensitive model metadata.
+- **FR-002a** *(Decision 95 amend)*: A candidate MAY declare `provider_implementation_id: "exact-ref.wasm-cpu"` instead of a native provider id. Such a candidate MUST reference an existing `044-application-bundle-manifest` `exact_model_dependencies` pin by `model_id` and `version` in place of its own model identifier/digest — it MUST NOT declare an independent digest. Resolution MUST fail closed with `model_dependency_unsatisfied` if the referenced pin's declared `traverse.model-runtime` connector binding is not activated. Execution of an `exact-ref.wasm-cpu` candidate is delegated entirely to `138-governed-exact-model-execution`'s existing `model.execute` path; this spec governs only candidate declaration and selection, never the verified-execution mechanism itself.
 - **FR-003**: Model dependencies MUST be satisfied by real governed inference capability implementations; fake, placeholder, or documentation-only implementations MUST NOT satisfy readiness or execution.
 - **FR-004**: The first approved provider path MUST support a real local Ollama-backed inference implementation behind a Traverse-governed inference capability interface.
 - **FR-005**: Downstream apps MUST depend on the abstract inference interface and candidate set; downstream app product code MUST NOT hardcode provider-specific inference calls.
 - **FR-006**: Traverse MUST evaluate model candidates using this MVP heuristic order: provider/model availability, requested inference interface support, placement policy, minimum context window, then app-declared priority.
+- **FR-006a** *(Decision 95 amend)*: Candidate availability evaluation MUST be platform-aware: a candidate whose provider implementation cannot execute on the current placement target (for example, an `ollama.local.generate` candidate under a wasm32/browser placement target) MUST be treated as unavailable and skipped in favor of the next passing candidate, rather than surfacing as an execution-time failure.
 - **FR-007**: If all filtered candidates fail, Traverse MUST return `model_dependency_unsatisfied` with non-sensitive rejection reasons for each candidate.
 - **FR-008**: Traverse MUST perform model readiness checks during app setup or bundle validation and include readiness results in app readiness evidence.
 - **FR-009**: Traverse MUST revalidate model availability and basic fit at execution time before invoking inference.
 - **FR-010**: Execution-time revalidation MAY select a different passing candidate than setup validation when the original candidate is unavailable and policy permits fallback; the trace MUST record the change.
 - **FR-011**: Candidate selection MUST be deterministic for the same app manifest, workspace-local config, provider state, and model metadata.
 - **FR-012**: Public trace evidence MUST include requested interface, evaluated candidates, rejected candidate reasons, selected provider, selected model, selected placement, and selection reason.
+- **FR-012a** *(Decision 95 amend)*: Public trace evidence (and `traverse.inference.generate` response evidence) MUST include a `trust_class` value of `verified_signed_package` (for `exact-ref.wasm-cpu` candidates) or `local_unverified_daemon` (for `ollama.local.generate` candidates), populated regardless of which candidate kind was selected, so callers can distinguish signed-and-verified execution from local-daemon execution without inspecting provider-implementation-specific strings. This is a breaking change to the previously-published evidence shape; `traverse.inference.generate` bumps `1.0.0` → `2.0.0`.
 - **FR-013**: Public trace evidence MUST NOT include private prompts, private source text, secret provider configuration, or raw model credentials.
 - **FR-014**: Missing provider, missing model, unsupported interface, insufficient context window, invalid candidate config, and unsatisfied model dependency failures MUST each have stable machine-readable error codes.
 - **FR-015**: Model readiness evidence MUST distinguish setup validation failures from execution-time availability failures.
@@ -138,6 +141,7 @@ As a UI or auditor, I want public trace evidence to show which model/provider wa
 - **Model Readiness Evidence**: Setup-time validation output showing provider availability, model availability, interface support, context fit, and candidate selection readiness.
 - **Model Resolution Trace**: Execution-time trace evidence showing evaluated candidates, selected candidate, placement, and reasons.
 - **Basic Model Fit**: MVP candidate filters for requested interface, placement policy, and minimum context window.
+- **Exact-Ref Candidate** *(Decision 95 amend)*: A model candidate whose `provider_implementation_id` is `exact-ref.wasm-cpu`. It references an existing Spec 044 `exact_model_dependencies` pin instead of declaring its own model identity, and its execution is delegated entirely to Spec 138's `model.execute`. It carries `trust_class: verified_signed_package` in evidence, versus `local_unverified_daemon` for Ollama-backed candidates.
 
 ## Success Criteria
 
@@ -163,6 +167,8 @@ As a UI or auditor, I want public trace evidence to show which model/provider wa
 - [#452](https://github.com/enricopiovesan/Traverse/issues/452) - Resolve model dependencies at setup and execution time.
 - [#453](https://github.com/enricopiovesan/Traverse/issues/453) - Expose model selection evidence in traces and MCP reports.
 - [#454](https://github.com/enricopiovesan/Traverse/issues/454) - Add downstream app MVP conformance suite across specs 044 and 045.
+- [#1454](https://github.com/traverse-framework/traverse/issues/1454) - Bridge Spec 045↔138: `exact-ref.wasm-cpu` candidate kind, `trust_class` evidence, platform-aware resolution (Decision 95 amend).
+- [#1455](https://github.com/traverse-framework/traverse/issues/1455) - Text-generating exact-ref fixture proving the bridge end-to-end.
 
 ## Out of Scope
 
@@ -173,7 +179,10 @@ As a UI or auditor, I want public trace evidence to show which model/provider wa
 - Model weight distribution, native installers, or package-manager installation.
 - Embedding-specific interfaces unless added by a later approved spec.
 - Product-level answer quality scoring beyond model selection and traceability.
-- Exact-ref signed WASM model package execution, host-staged tensor I/O, and
-  CPU-WASM conformance — those are governed by
-  `138-governed-exact-model-execution` (Decision 91). This spec remains the
-  candidate/LLM resolution track and does not satisfy Spec 138’s DoD.
+- Exact-ref signed WASM model package execution, host-staged tensor I/O,
+  digest verification, and CPU-WASM conformance itself — those remain
+  entirely governed by `138-governed-exact-model-execution` (Decision 91)
+  and are never satisfied by this spec. The `exact-ref.wasm-cpu` candidate
+  kind (Decision 95, FR-002a) only lets an app *declare and select* such a
+  pin as one candidate among others through this spec's resolution
+  machinery; it does not reopen or duplicate Spec 138's execution DoD.

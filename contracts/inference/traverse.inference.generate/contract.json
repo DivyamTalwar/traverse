@@ -4,14 +4,14 @@
   "id": "traverse.inference.generate",
   "namespace": "traverse.inference",
   "name": "generate",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "lifecycle": "active",
   "owner": {
     "team": "traverse-core",
     "contact": "enrico.piovesan10@gmail.com"
   },
   "summary": "Generate text through a Traverse-governed inference provider implementation.",
-  "description": "Provider-neutral inference interface satisfied first by the real local Ollama implementation. Downstream app product logic depends on this interface rather than direct provider APIs.",
+  "description": "Provider-neutral inference interface satisfied by a real local Ollama implementation or, per Decision 95, a Spec 138 exact-ref signed WASM package candidate. Downstream app product logic depends on this interface rather than direct provider APIs.",
   "inputs": {
     "schema": {
       "type": "object",
@@ -72,7 +72,8 @@
           "required": [
             "placement_target",
             "selected_provider",
-            "selected_model"
+            "selected_model",
+            "trust_class"
           ],
           "properties": {
             "placement_target": {
@@ -83,6 +84,14 @@
             },
             "selected_model": {
               "type": "string"
+            },
+            "trust_class": {
+              "type": "string",
+              "enum": [
+                "verified_signed_package",
+                "local_unverified_daemon"
+              ],
+              "description": "Decision 95 (Spec 045/138 bridge): distinguishes a digest-verified Spec 138 exact-ref execution from a local, unsigned provider daemon execution."
             }
           },
           "additionalProperties": false
