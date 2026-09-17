@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -14,6 +14,13 @@ use traverse_registry::{
     ModelResolutionRequest, resolve_model_dependency,
 };
 
+use crate::exact_model::{
+    ExactModelHostConnector, ExactModelPin, decode_guest_frame, encode_guest_frame,
+};
+use crate::host_connector_dispatch::{
+    HostConnectorHostRequest, HostConnectorPort, MODEL_EXECUTE_OPERATION, MODEL_RUNTIME_CONNECTOR,
+};
+
 const OLLAMA_PROVIDER: &str = "ollama";
 const GENERATE_INTERFACE: &str = "traverse.inference.generate";
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -21,6 +28,14 @@ const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 /// possibly untrusted) inference endpoint, guarding against unbounded memory
 /// growth (spec 045-governed-model-dependency-resolution).
 const DEFAULT_MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Spec 045/138 bridge (Decision 95): candidate kind delegating execution to
+/// Spec 138's `model.execute` instead of a native provider daemon.
+const EXACT_REF_PROVIDER: &str = "exact-ref.wasm-cpu";
+/// Guest frame dtype for the bridge's opaque UTF-8 prompt/response payloads.
+const EXACT_REF_TEXT_DTYPE: u8 = 4;
+const EXACT_REF_STAGE_MAX_BYTES: usize = 1_048_576;
+const EXACT_REF_MAX_OUTPUT_BYTES: usize = 65_536;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OllamaProviderConfig {
@@ -57,21 +72,46 @@ pub struct OllamaInferenceRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OllamaInferenceOutput {
+pub struct GenerateOutput {
     pub interface_id: String,
     pub provider: String,
     pub provider_implementation_id: String,
     pub model: String,
     pub response: String,
     pub done: bool,
-    pub evidence: OllamaInferenceEvidence,
+    pub evidence: GenerateEvidence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OllamaInferenceEvidence {
+pub struct GenerateEvidence {
     pub placement_target: String,
     pub selected_provider: String,
     pub selected_model: String,
+    /// Spec 045/138 bridge (Decision 95, FR-012a): distinguishes a
+    /// digest-verified exact-ref package execution from a local, unsigned
+    /// daemon execution, regardless of which candidate kind was selected.
+    pub trust_class: InferenceTrustClass,
+}
+
+/// Spec 045/138 bridge (Decision 95, FR-012a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceTrustClass {
+    /// The response came from a Spec 138 exact-ref signed WASM package,
+    /// digest-verified before execution.
+    VerifiedSignedPackage,
+    /// The response came from a local, unsigned provider daemon (Ollama).
+    LocalUnverifiedDaemon,
+}
+
+impl InferenceTrustClass {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::VerifiedSignedPackage => "verified_signed_package",
+            Self::LocalUnverifiedDaemon => "local_unverified_daemon",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,7 +129,7 @@ pub struct GovernedModelExecutionRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GovernedModelExecutionOutcome {
-    pub output: OllamaInferenceOutput,
+    pub output: GenerateOutput,
     pub model_resolution: ModelResolutionEvidence,
 }
 
@@ -213,7 +253,7 @@ impl OllamaInferenceProvider {
     pub fn generate(
         &self,
         request: &OllamaInferenceRequest,
-    ) -> Result<OllamaInferenceOutput, OllamaInferenceError> {
+    ) -> Result<GenerateOutput, OllamaInferenceError> {
         validate_generate_request(request)?;
         self.check_model_available(&request.model)?;
 
@@ -380,6 +420,281 @@ pub fn execute_governed_ollama_model_dependency(
     })
 }
 
+/// Spec 045/138 bridge (Decision 95): resolves a model dependency whose
+/// candidates may be `ollama.local.generate` or `exact-ref.wasm-cpu`, and
+/// executes whichever kind is selected. Exact-ref execution is delegated
+/// entirely to `138-governed-exact-model-execution`'s `model.execute`; this
+/// function only wires the prompt/response bytes through that existing path.
+///
+/// # Errors
+///
+/// Returns [`GovernedModelExecutionError`] under the same conditions as
+/// [`execute_governed_ollama_model_dependency`], plus provider execution
+/// failure when the selected exact-ref candidate's referenced pin is missing
+/// or `model.execute` itself fails.
+pub fn execute_governed_bridged_model_dependency(
+    dependency: &ApplicationModelDependency,
+    request: &GovernedModelExecutionRequest,
+    exact_model_pins: &[ExactModelPin],
+    activated_exact_ref_pins: &BTreeSet<(String, String)>,
+    exact_model_host: &mut ExactModelHostConnector,
+    exact_ref_policy_ref: &str,
+    exact_ref_data_classification: &str,
+) -> Result<GovernedModelExecutionOutcome, GovernedModelExecutionError> {
+    if dependency.interface_id != request.interface_id {
+        return Err(GovernedModelExecutionError::new(
+            GovernedModelExecutionErrorCode::InterfaceNotDeclared,
+            "requested inference interface is not declared by this app dependency",
+        ));
+    }
+
+    let ollama_probe = request.provider_configs.iter().fold(
+        OllamaModelAvailabilityProbe::default(),
+        |probe, (implementation_id, config)| {
+            probe.with_provider_config(implementation_id.clone(), config.clone())
+        },
+    );
+    let probe = BridgedModelAvailabilityProbe::new(ollama_probe, activated_exact_ref_pins.clone());
+    let resolution_request = ModelResolutionRequest {
+        phase: ModelResolutionPhase::Execution,
+        requested_interface_id: request.interface_id.clone(),
+        requested_placement: request.requested_placement.clone(),
+    };
+    let evidence = resolve_model_dependency(dependency, &resolution_request, &probe);
+    let Some(selected) = evidence.selected.as_ref() else {
+        return Err(GovernedModelExecutionError::new(
+            GovernedModelExecutionErrorCode::ModelDependencyUnsatisfied,
+            "no app-declared model candidate satisfied execution-time resolution",
+        )
+        .with_model_resolution(evidence));
+    };
+
+    if selected.provider_implementation_id == EXACT_REF_PROVIDER {
+        // `selected.candidate_id` always names an entry in `dependency.candidates`:
+        // resolution derives it by evaluating this same list, never any other
+        // source. Direct indexing mirrors the existing
+        // `request.provider_configs[&selected.provider_implementation_id]`
+        // access below for the same reason.
+        let candidates_by_id: BTreeMap<&str, &ModelCandidate> = dependency
+            .candidates
+            .iter()
+            .map(|candidate| (candidate.candidate_id.as_str(), candidate))
+            .collect();
+        let candidate = candidates_by_id[selected.candidate_id.as_str()];
+        let output = execute_exact_ref_candidate(
+            candidate,
+            request,
+            exact_model_pins,
+            exact_model_host,
+            exact_ref_policy_ref,
+            exact_ref_data_classification,
+        )
+        .map_err(|message| {
+            GovernedModelExecutionError::new(
+                GovernedModelExecutionErrorCode::ProviderExecutionFailed,
+                message,
+            )
+            .with_model_resolution(evidence.clone())
+        })?;
+        return Ok(GovernedModelExecutionOutcome {
+            output,
+            model_resolution: evidence,
+        });
+    }
+
+    let provider = OllamaInferenceProvider::from_validated_config(
+        request.provider_configs[&selected.provider_implementation_id].clone(),
+    );
+    let output = provider
+        .generate(&OllamaInferenceRequest {
+            model: selected.model_identifier.clone(),
+            prompt: request.prompt.clone(),
+            system_prompt: request.system_prompt.clone(),
+            options: request.options.clone(),
+        })
+        .map_err(|error| {
+            GovernedModelExecutionError::new(
+                GovernedModelExecutionErrorCode::ProviderExecutionFailed,
+                error.to_string(),
+            )
+            .with_model_resolution(evidence.clone())
+        })?;
+
+    Ok(GovernedModelExecutionOutcome {
+        output,
+        model_resolution: evidence,
+    })
+}
+
+/// Spec 045/138 bridge (Decision 95): evaluates both `ollama.local.generate`
+/// and `exact-ref.wasm-cpu` candidates in one resolution pass.
+#[derive(Debug, Clone)]
+pub struct BridgedModelAvailabilityProbe {
+    ollama: OllamaModelAvailabilityProbe,
+    activated_exact_ref_pins: BTreeSet<(String, String)>,
+}
+
+impl BridgedModelAvailabilityProbe {
+    #[must_use]
+    pub fn new(
+        ollama: OllamaModelAvailabilityProbe,
+        activated_exact_ref_pins: BTreeSet<(String, String)>,
+    ) -> Self {
+        Self {
+            ollama,
+            activated_exact_ref_pins,
+        }
+    }
+}
+
+impl ModelAvailabilityProbe for BridgedModelAvailabilityProbe {
+    fn check_candidate(
+        &self,
+        dependency: &ApplicationModelDependency,
+        candidate: &ModelCandidate,
+    ) -> ModelCandidateAvailability {
+        if candidate.provider_implementation_id == EXACT_REF_PROVIDER {
+            return check_exact_ref_candidate_availability(
+                candidate,
+                &self.activated_exact_ref_pins,
+            );
+        }
+        self.ollama.check_candidate(dependency, candidate)
+    }
+}
+
+/// FR-002a: an `exact-ref.wasm-cpu` candidate is available only when its
+/// referenced Spec 044 pin (by `model_id`+`version`, carried in
+/// `metadata.exact_ref_model_id`/`metadata.exact_ref_version`) has an
+/// activated `traverse.model-runtime` binding. This does not check whether
+/// the underlying signed package bytes are physically cached — that is
+/// re-verified fail-closed by `model.execute` itself at invocation time.
+fn check_exact_ref_candidate_availability(
+    candidate: &ModelCandidate,
+    activated_exact_ref_pins: &BTreeSet<(String, String)>,
+) -> ModelCandidateAvailability {
+    let Some(model_id) = candidate
+        .metadata
+        .get("exact_ref_model_id")
+        .and_then(Value::as_str)
+    else {
+        return ModelCandidateAvailability::rejected(
+            ModelCandidateRejectionCode::ModelCandidateConfigInvalid,
+            "exact-ref candidate is missing exact_ref_model_id metadata",
+        );
+    };
+    let Some(version) = candidate
+        .metadata
+        .get("exact_ref_version")
+        .and_then(Value::as_str)
+    else {
+        return ModelCandidateAvailability::rejected(
+            ModelCandidateRejectionCode::ModelCandidateConfigInvalid,
+            "exact-ref candidate is missing exact_ref_version metadata",
+        );
+    };
+    if activated_exact_ref_pins.contains(&(model_id.to_string(), version.to_string())) {
+        ModelCandidateAvailability::ready()
+    } else {
+        ModelCandidateAvailability::rejected(
+            ModelCandidateRejectionCode::ModelProviderUnavailable,
+            "referenced exact_model_dependencies pin has no activated traverse.model-runtime binding",
+        )
+    }
+}
+
+/// Encodes the prompt, stages it, invokes `model.execute` on the referenced
+/// exact-ref pin, and decodes the response frame's payload as UTF-8 text.
+fn execute_exact_ref_candidate(
+    candidate: &ModelCandidate,
+    request: &GovernedModelExecutionRequest,
+    exact_model_pins: &[ExactModelPin],
+    host: &mut ExactModelHostConnector,
+    policy_ref: &str,
+    data_classification: &str,
+) -> Result<GenerateOutput, String> {
+    let model_id = candidate
+        .metadata
+        .get("exact_ref_model_id")
+        .and_then(Value::as_str)
+        .ok_or("exact-ref candidate is missing exact_ref_model_id metadata")?;
+    let version = candidate
+        .metadata
+        .get("exact_ref_version")
+        .and_then(Value::as_str)
+        .ok_or("exact-ref candidate is missing exact_ref_version metadata")?;
+    let input_schema_ref = candidate
+        .metadata
+        .get("exact_ref_input_schema_ref")
+        .and_then(Value::as_str)
+        .unwrap_or("schema:bridged-generate-in");
+    let input_schema_version = candidate
+        .metadata
+        .get("exact_ref_input_schema_version")
+        .and_then(Value::as_str)
+        .unwrap_or("1.0.0");
+    let pin = exact_model_pins
+        .iter()
+        .find(|pin| pin.model_id == model_id && pin.version == version)
+        .ok_or_else(|| format!("no exact_model_dependencies pin found for {model_id}@{version}"))?;
+
+    let prompt_bytes = request.prompt.as_bytes();
+    let dims = [u32::try_from(prompt_bytes.len()).unwrap_or(u32::MAX)];
+    let frame = encode_guest_frame(EXACT_REF_TEXT_DTYPE, &dims, prompt_bytes);
+    let input_ref = host
+        .io
+        .stage_model_input(&frame, EXACT_REF_STAGE_MAX_BYTES)
+        .map_err(|error| error.to_string())?;
+
+    let host_request = HostConnectorHostRequest {
+        connector_id: MODEL_RUNTIME_CONNECTOR.to_string(),
+        operation: MODEL_EXECUTE_OPERATION.to_string(),
+        binding_id: "bridged-exact-ref".to_string(),
+        target_family: format!("{:?}", request.requested_placement),
+        correlation_id: format!("bridge-{model_id}-{version}"),
+        payload: json!({
+            "model_ref": {
+                "model_id": pin.model_id,
+                "version": pin.version,
+                "digest": pin.digest,
+            },
+            "input_ref": input_ref,
+            "policy_ref": policy_ref,
+            "data_classification": data_classification,
+            "input_schema_ref": input_schema_ref,
+            "input_schema_version": input_schema_version,
+            "max_output_bytes": EXACT_REF_MAX_OUTPUT_BYTES,
+        }),
+        cancel_requested: false,
+    };
+    let result = host
+        .invoke(&host_request)
+        .map_err(|error| error.to_string())?;
+    let output_bytes = host
+        .io
+        .read_model_output(&result.artifact_ref, EXACT_REF_MAX_OUTPUT_BYTES)
+        .map_err(|error| error.to_string())?;
+    let (_, _, payload) = decode_guest_frame(&output_bytes).map_err(|error| error.to_string())?;
+    let text = String::from_utf8(payload)
+        .map_err(|error| format!("exact-ref response was not valid UTF-8: {error}"))?;
+    let model_display = format!("{model_id}@{version}");
+
+    Ok(GenerateOutput {
+        interface_id: GENERATE_INTERFACE.to_string(),
+        provider: "exact-ref".to_string(),
+        provider_implementation_id: EXACT_REF_PROVIDER.to_string(),
+        model: model_display.clone(),
+        response: text,
+        done: true,
+        evidence: GenerateEvidence {
+            placement_target: format!("{:?}", request.requested_placement),
+            selected_provider: "exact-ref".to_string(),
+            selected_model: model_display,
+            trust_class: InferenceTrustClass::VerifiedSignedPackage,
+        },
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OllamaInferenceErrorCode {
@@ -483,7 +798,7 @@ fn parse_generate_response(
     provider_implementation_id: &str,
     requested_model: &str,
     response: &Value,
-) -> Result<OllamaInferenceOutput, OllamaInferenceError> {
+) -> Result<GenerateOutput, OllamaInferenceError> {
     let text = response
         .get("response")
         .and_then(Value::as_str)
@@ -502,17 +817,18 @@ fn parse_generate_response(
         .and_then(Value::as_str)
         .unwrap_or(requested_model);
 
-    Ok(OllamaInferenceOutput {
+    Ok(GenerateOutput {
         interface_id: GENERATE_INTERFACE.to_string(),
         provider: OLLAMA_PROVIDER.to_string(),
         provider_implementation_id: provider_implementation_id.to_string(),
         model: model.to_string(),
         response: text.to_string(),
         done,
-        evidence: OllamaInferenceEvidence {
+        evidence: GenerateEvidence {
             placement_target: "local".to_string(),
             selected_provider: OLLAMA_PROVIDER.to_string(),
             selected_model: model.to_string(),
+            trust_class: InferenceTrustClass::LocalUnverifiedDaemon,
         },
     })
 }

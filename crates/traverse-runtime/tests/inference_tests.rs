@@ -1,7 +1,7 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -18,11 +18,15 @@ use traverse_registry::{
     ModelCandidateRejectionCode, ModelResolutionPhase, ModelResolutionRequest,
     ModelSelectionPolicy, RegistryProvenance, RegistryScope, SourceKind, SourceReference,
 };
+use traverse_runtime::exact_model::{
+    ExactModelHostConnector, ExactModelPin, ExecutionPolicy, FIXTURE_ECHO_WAT,
+    ModelPackageManifest, PLACEMENT_WASM_CPU, VerifiedModelPackage, digest_hex,
+};
 use traverse_runtime::inference::{
     GovernedModelExecutionError, GovernedModelExecutionErrorCode, GovernedModelExecutionRequest,
-    OllamaInferenceErrorCode, OllamaInferenceProvider, OllamaInferenceRequest,
-    OllamaModelAvailabilityProbe, OllamaProviderConfig, execute_governed_ollama_model_dependency,
-    resolve_ollama_model_dependency,
+    InferenceTrustClass, OllamaInferenceErrorCode, OllamaInferenceProvider, OllamaInferenceRequest,
+    OllamaModelAvailabilityProbe, OllamaProviderConfig, execute_governed_bridged_model_dependency,
+    execute_governed_ollama_model_dependency, resolve_ollama_model_dependency,
 };
 
 #[test]
@@ -790,6 +794,394 @@ fn governed_model_execution_reports_provider_execution_failure_with_evidence() {
             .selected
             .is_some()
     );
+}
+
+#[test]
+fn inference_trust_class_as_str_is_stable() {
+    assert_eq!(
+        InferenceTrustClass::VerifiedSignedPackage.as_str(),
+        "verified_signed_package"
+    );
+    assert_eq!(
+        InferenceTrustClass::LocalUnverifiedDaemon.as_str(),
+        "local_unverified_daemon"
+    );
+}
+
+#[test]
+fn bridge_rejects_undeclared_interface() {
+    let (mut host, pin) = seeded_exact_ref_host();
+    let dependency = model_dependency(vec![exact_ref_candidate(
+        "exact-ref-choice",
+        &pin,
+        20,
+        8192,
+    )]);
+    let mut request = governed_model_request("traverse.inference.embed", "unused");
+    request.provider_configs.clear();
+    let activated: BTreeSet<(String, String)> =
+        [(pin.model_id.clone(), pin.version.clone())].into();
+
+    let error = execute_governed_bridged_model_dependency(
+        &dependency,
+        &request,
+        std::slice::from_ref(&pin),
+        &activated,
+        &mut host,
+        "policy-1",
+        "sensitive",
+    )
+    .expect_err("undeclared interface should fail before resolution");
+
+    assert_eq!(
+        error.code,
+        GovernedModelExecutionErrorCode::InterfaceNotDeclared
+    );
+    assert!(error.model_resolution.is_none());
+}
+
+#[test]
+fn bridge_reports_ollama_provider_execution_failure_with_evidence() {
+    let (mut host, pin) = seeded_exact_ref_host();
+    let base_url = start_ollama_server(vec![
+        json!({"models": [{"name": "llama3.2:3b"}]}).to_string(),
+        json!({"models": [{"name": "llama3.2:3b"}]}).to_string(),
+        json!({"model": "llama3.2:3b", "done": true}).to_string(),
+    ]);
+    let dependency = model_dependency(vec![model_candidate("bad-generate", "llama3.2:3b", 20, 8192)]);
+    let activated: BTreeSet<(String, String)> = BTreeSet::new();
+
+    let error = execute_governed_bridged_model_dependency(
+        &dependency,
+        &governed_model_request("traverse.inference.generate", &base_url),
+        std::slice::from_ref(&pin),
+        &activated,
+        &mut host,
+        "policy-1",
+        "sensitive",
+    )
+    .expect_err("invalid provider output should fail execution");
+
+    assert_eq!(
+        error.code,
+        GovernedModelExecutionErrorCode::ProviderExecutionFailed
+    );
+    assert!(
+        error
+            .model_resolution
+            .expect("provider failure should retain selected model evidence")
+            .selected
+            .is_some()
+    );
+}
+
+#[test]
+fn bridge_rejects_exact_ref_candidate_missing_version_metadata() {
+    let (mut host, pin) = seeded_exact_ref_host();
+    let mut malformed = exact_ref_candidate("malformed-version", &pin, 20, 8192);
+    malformed.metadata = json!({
+        "implementation_kind": "exact_ref_package",
+        "exact_ref_model_id": pin.model_id,
+        "capabilities": ["text_generation"],
+        "model_context_window": 8192
+    });
+    let dependency = model_dependency(vec![malformed]);
+    let mut request = governed_model_request("traverse.inference.generate", "unused");
+    request.provider_configs.clear();
+    let activated: BTreeSet<(String, String)> =
+        [(pin.model_id.clone(), pin.version.clone())].into();
+
+    let error = execute_governed_bridged_model_dependency(
+        &dependency,
+        &request,
+        std::slice::from_ref(&pin),
+        &activated,
+        &mut host,
+        "policy-1",
+        "sensitive",
+    )
+    .expect_err("a candidate missing exact_ref_version metadata must fail closed");
+
+    assert_eq!(
+        error
+            .model_resolution
+            .expect("resolution evidence should be attached")
+            .candidates[0]
+            .rejection_code,
+        Some(ModelCandidateRejectionCode::ModelCandidateConfigInvalid)
+    );
+}
+
+#[test]
+fn bridge_resolves_and_executes_exact_ref_candidate_with_verified_evidence() {
+    let (mut host, pin) = seeded_exact_ref_host();
+    let dependency = model_dependency(vec![exact_ref_candidate(
+        "exact-ref-choice",
+        &pin,
+        20,
+        8192,
+    )]);
+    let mut request = governed_model_request("traverse.inference.generate", "unused");
+    request.provider_configs.clear();
+    let activated: BTreeSet<(String, String)> =
+        [(pin.model_id.clone(), pin.version.clone())].into();
+
+    let outcome = execute_governed_bridged_model_dependency(
+        &dependency,
+        &request,
+        std::slice::from_ref(&pin),
+        &activated,
+        &mut host,
+        "policy-1",
+        "sensitive",
+    )
+    .expect("exact-ref candidate should resolve and execute");
+
+    assert_eq!(outcome.output.response, request.prompt);
+    assert_eq!(
+        outcome.output.evidence.trust_class,
+        InferenceTrustClass::VerifiedSignedPackage
+    );
+    assert_eq!(
+        outcome
+            .model_resolution
+            .selected
+            .expect("selected candidate should be recorded")
+            .candidate_id,
+        "exact-ref-choice"
+    );
+}
+
+#[test]
+fn bridge_falls_back_to_ollama_when_exact_ref_binding_not_activated() {
+    let (mut host, pin) = seeded_exact_ref_host();
+    let base_url = start_ollama_server(vec![
+        json!({"models": [{"name": "llama3.2:3b"}]}).to_string(),
+        json!({"models": [{"name": "llama3.2:3b"}]}).to_string(),
+        json!({"model": "llama3.2:3b", "response": "from ollama", "done": true}).to_string(),
+    ]);
+    let dependency = model_dependency(vec![
+        exact_ref_candidate("exact-ref-unavailable", &pin, 30, 8192),
+        model_candidate("ollama-fallback", "llama3.2:3b", 10, 8192),
+    ]);
+    let request = governed_model_request("traverse.inference.generate", &base_url);
+    let activated: BTreeSet<(String, String)> = BTreeSet::new();
+
+    let outcome = execute_governed_bridged_model_dependency(
+        &dependency,
+        &request,
+        std::slice::from_ref(&pin),
+        &activated,
+        &mut host,
+        "policy-1",
+        "sensitive",
+    )
+    .expect("ollama candidate should be selected when the exact-ref pin is not activated");
+
+    assert_eq!(outcome.output.response, "from ollama");
+    assert_eq!(
+        outcome.output.evidence.trust_class,
+        InferenceTrustClass::LocalUnverifiedDaemon
+    );
+    assert_eq!(
+        outcome
+            .model_resolution
+            .candidates
+            .iter()
+            .find(|evaluation| evaluation.candidate_id == "exact-ref-unavailable")
+            .expect("exact-ref candidate should be evaluated")
+            .rejection_code,
+        Some(ModelCandidateRejectionCode::ModelProviderUnavailable)
+    );
+}
+
+#[test]
+fn bridge_platform_aware_resolution_skips_ollama_on_non_local_placement() {
+    let (mut host, pin) = seeded_exact_ref_host();
+    // A real, reachable Ollama server: proves the candidate is rejected for
+    // placement, not because it was unavailable for an unrelated reason.
+    let base_url = start_ollama_server(vec![
+        json!({"models": [{"name": "llama3.2:3b"}]}).to_string(),
+    ]);
+    let mut exact_ref = exact_ref_candidate("exact-ref-browser", &pin, 10, 8192);
+    exact_ref.placement_target = ExecutionTarget::Browser;
+    let mut ollama = model_candidate("ollama-local-only", "llama3.2:3b", 30, 8192);
+    ollama.placement_target = ExecutionTarget::Local;
+    let dependency = model_dependency(vec![ollama, exact_ref]);
+    let mut request = governed_model_request("traverse.inference.generate", &base_url);
+    request.requested_placement = ExecutionTarget::Browser;
+    let activated: BTreeSet<(String, String)> =
+        [(pin.model_id.clone(), pin.version.clone())].into();
+
+    let outcome = execute_governed_bridged_model_dependency(
+        &dependency,
+        &request,
+        std::slice::from_ref(&pin),
+        &activated,
+        &mut host,
+        "policy-1",
+        "sensitive",
+    )
+    .expect("exact-ref candidate should be selected on a placement Ollama cannot serve");
+
+    assert_eq!(
+        outcome
+            .model_resolution
+            .selected
+            .expect("selected candidate should be recorded")
+            .candidate_id,
+        "exact-ref-browser"
+    );
+    assert_eq!(
+        outcome
+            .model_resolution
+            .candidates
+            .iter()
+            .find(|evaluation| evaluation.candidate_id == "ollama-local-only")
+            .expect("ollama candidate should be evaluated")
+            .rejection_code,
+        Some(ModelCandidateRejectionCode::ModelCandidateConfigInvalid)
+    );
+}
+
+#[test]
+fn bridge_rejects_exact_ref_candidate_missing_metadata() {
+    let (mut host, pin) = seeded_exact_ref_host();
+    let mut malformed = exact_ref_candidate("malformed", &pin, 20, 8192);
+    malformed.metadata = json!({
+        "implementation_kind": "exact_ref_package",
+        "capabilities": ["text_generation"],
+        "model_context_window": 8192
+    });
+    let dependency = model_dependency(vec![malformed]);
+    let mut request = governed_model_request("traverse.inference.generate", "unused");
+    request.provider_configs.clear();
+    let activated: BTreeSet<(String, String)> =
+        [(pin.model_id.clone(), pin.version.clone())].into();
+
+    let error = execute_governed_bridged_model_dependency(
+        &dependency,
+        &request,
+        std::slice::from_ref(&pin),
+        &activated,
+        &mut host,
+        "policy-1",
+        "sensitive",
+    )
+    .expect_err("a candidate missing exact_ref_model_id metadata must fail closed");
+
+    assert_eq!(
+        error.code,
+        GovernedModelExecutionErrorCode::ModelDependencyUnsatisfied
+    );
+    assert_eq!(
+        error
+            .model_resolution
+            .expect("resolution evidence should be attached")
+            .candidates[0]
+            .rejection_code,
+        Some(ModelCandidateRejectionCode::ModelCandidateConfigInvalid)
+    );
+}
+
+#[test]
+fn bridge_fails_closed_when_no_pin_matches_referenced_candidate() {
+    let (mut host, pin) = seeded_exact_ref_host();
+    let dependency = model_dependency(vec![exact_ref_candidate("dangling", &pin, 20, 8192)]);
+    let mut request = governed_model_request("traverse.inference.generate", "unused");
+    request.provider_configs.clear();
+    let activated: BTreeSet<(String, String)> =
+        [(pin.model_id.clone(), pin.version.clone())].into();
+
+    let error = execute_governed_bridged_model_dependency(
+        &dependency,
+        &request,
+        &[], // no pins supplied, even though the availability set says it's activated
+        &activated,
+        &mut host,
+        "policy-1",
+        "sensitive",
+    )
+    .expect_err("execution must fail closed when the referenced pin cannot be found");
+
+    assert_eq!(
+        error.code,
+        GovernedModelExecutionErrorCode::ProviderExecutionFailed
+    );
+}
+
+fn seeded_exact_ref_host() -> (ExactModelHostConnector, ExactModelPin) {
+    let wasm = wat::parse_str(FIXTURE_ECHO_WAT).expect("wat should parse");
+    let digest = digest_hex(&wasm);
+    let manifest = ModelPackageManifest {
+        schema_version: "1.0.0".to_string(),
+        model_id: "fixture.echo".to_string(),
+        version: "1.0.0".to_string(),
+        wasm_digest: digest.clone(),
+        package_digest: digest.clone(),
+        registry_ref: "registry:fixture.echo@1.0.0".to_string(),
+        executable_format: "traverse-model-wasm".to_string(),
+        abi_version: 1,
+        input_schema_ref: "schema:bridged-generate-in".to_string(),
+        input_schema_version: "1.0.0".to_string(),
+        output_schema_ref: "schema:bridged-generate-out".to_string(),
+        output_schema_version: "1.0.0".to_string(),
+        license_id: "Apache-2.0".to_string(),
+        attribution: "Traverse test fixture".to_string(),
+        redistribution: "test-only".to_string(),
+        supported_profiles: vec![PLACEMENT_WASM_CPU.to_string()],
+        max_memory_bytes: 2 * 64 * 1024,
+        max_fuel: 1_000_000,
+        max_input_bytes: 4096,
+        max_output_bytes: 4096,
+        max_execution_ms: 5_000,
+        offline_allowed: true,
+    };
+    let pin = ExactModelPin {
+        model_id: manifest.model_id.clone(),
+        version: manifest.version.clone(),
+        digest: digest.clone(),
+        offline_allowed: true,
+    };
+    let mut host = ExactModelHostConnector::new(vec![pin.clone()]);
+    host.packages
+        .insert_verified(VerifiedModelPackage { manifest, wasm })
+        .expect("package should verify");
+    host.policies.insert(
+        "policy-1".to_string(),
+        ExecutionPolicy {
+            policy_ref: "policy-1".to_string(),
+            allowed_classifications: vec!["sensitive".to_string()],
+            max_output_bytes: 4096,
+        },
+    );
+    (host, pin)
+}
+
+fn exact_ref_candidate(
+    candidate_id: &str,
+    pin: &ExactModelPin,
+    priority: u32,
+    context_window: u64,
+) -> ModelCandidate {
+    ModelCandidate {
+        candidate_id: candidate_id.to_string(),
+        provider_capability_id: "traverse.inference.generate".to_string(),
+        provider_implementation_id: "exact-ref.wasm-cpu".to_string(),
+        model_identifier: pin.model_id.clone(),
+        placement_target: ExecutionTarget::Local,
+        priority,
+        required_provider_config_keys: Vec::new(),
+        metadata: json!({
+            "implementation_kind": "exact_ref_package",
+            "exact_ref_model_id": pin.model_id,
+            "exact_ref_version": pin.version,
+            "exact_ref_input_schema_ref": "schema:bridged-generate-in",
+            "exact_ref_input_schema_version": "1.0.0",
+            "capabilities": ["text_generation"],
+            "model_context_window": context_window
+        }),
+    }
 }
 
 fn provider(base_url: &str) -> OllamaInferenceProvider {
