@@ -177,6 +177,8 @@ export interface TraverseEmbedderApi {
    * `runtime.subscribe`: register an ordered event callback. Previously
    * emitted events are replayed to the new subscriber first, so late
    * subscribers observe the identical ordered stream.
+   * Replay is synchronous outside event delivery. When called inside a
+   * callback, subscription replay waits until the active dispatch drains.
    */
   subscribe(callback: EventCallback): void;
   /** `compatible.start`: start a compatible-mode capability instance. */

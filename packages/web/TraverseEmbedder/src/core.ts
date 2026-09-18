@@ -47,6 +47,16 @@ interface CompatibleInstance {
   state: InstanceState;
 }
 
+/**
+ * A subscriber plus its position in the append-only event history. The
+ * cursor is what keeps every subscriber — live or late — on the same
+ * ascending sequence when a callback emits or subscribes reentrantly.
+ */
+interface Subscription {
+  readonly callback: EventCallback;
+  cursor: number;
+}
+
 export interface EmbeddedTraceRecordInput {
   readonly executionId: string;
   readonly targetId: string;
@@ -84,8 +94,9 @@ export class EmbedderCore {
   readonly platform: string;
   readonly compatibleTargets: Map<string, readonly string[]>;
   private readonly instances = new Map<string, CompatibleInstance>();
-  private readonly subscribers: EventCallback[] = [];
+  private readonly subscribers: Subscription[] = [];
   private readonly history: EmbedderEvent[] = [];
+  private dispatching = false;
   private nextEvent = 0;
   private nextSession = 0;
   private nextRequest = 0;
@@ -236,17 +247,46 @@ export class EmbedderCore {
       session_id: sessionId,
       data,
     };
-    for (const subscriber of this.subscribers) {
-      subscriber(event);
-    }
     this.history.push(event);
+    this.dispatch();
   }
 
   subscribe(callback: EventCallback): void {
-    for (const event of this.history) {
-      callback(event);
+    this.subscribers.push({ callback, cursor: 0 });
+    this.dispatch();
+  }
+
+  /**
+   * Delivers every undelivered history entry to every subscriber in
+   * ascending sequence order. A reentrant `emit` or `subscribe` only
+   * appends to the history or the subscriber list; the single active
+   * dispatch drains the backlog, so nested events can never reach a
+   * subscriber before the event that caused them. A throwing callback
+   * propagates to the caller after its cursor has advanced, so the
+   * exception stays visible, the event is not redelivered, and the next
+   * `emit`/`subscribe` resumes the remaining deliveries in order.
+   */
+  private dispatch(): void {
+    if (this.dispatching) {
+      return;
     }
-    this.subscribers.push(callback);
+    this.dispatching = true;
+    try {
+      let delivered = true;
+      while (delivered) {
+        delivered = false;
+        for (const subscription of [...this.subscribers]) {
+          while (subscription.cursor < this.history.length) {
+            const event = this.history[subscription.cursor]!;
+            subscription.cursor += 1;
+            delivered = true;
+            subscription.callback(event);
+          }
+        }
+      }
+    } finally {
+      this.dispatching = false;
+    }
   }
 
   emitErrorEvent(
