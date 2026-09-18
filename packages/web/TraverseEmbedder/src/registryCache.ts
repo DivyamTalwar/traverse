@@ -185,33 +185,79 @@ function compareSemver(left: string, right: string): number {
   return 0;
 }
 
-function matchesCaretRange(version: string, range: string): boolean {
-  const caret = range.startsWith("^") ? range.slice(1) : range;
+/** Numeric `major[.minor[.patch]]` components, or undefined when malformed. */
+function parseRangeVersion(value: string): readonly number[] | undefined {
+  const parts = value.split(".");
+  if (parts.length < 1 || parts.length > 3) {
+    return undefined;
+  }
+  const parsed: number[] = [];
+  for (const part of parts) {
+    if (!/^(0|[1-9]\d*)$/.test(part)) {
+      return undefined;
+    }
+    const number = Number.parseInt(part, 10);
+    if (!Number.isSafeInteger(number)) return undefined;
+    parsed.push(number);
+  }
+  return parsed;
+}
+
+function joinVersion(parts: readonly number[]): string {
+  return [parts[0] ?? 0, parts[1] ?? 0, parts[2] ?? 0].join(".");
+}
+
+/**
+ * Exclusive caret ceiling using Cargo semver semantics: bump the leftmost
+ * non-zero specified component, or the last specified component when every
+ * specified component is zero (`^0` → `<1.0.0`, `^0.0` → `<0.1.0`).
+ */
+function caretCeiling(bound: readonly number[]): string {
+  const nonZero = bound.findIndex((part) => part > 0);
+  const bumped = nonZero === -1 ? bound.length - 1 : nonZero;
+  const ceiling = [0, 0, 0];
+  for (let i = 0; i < bumped; i += 1) {
+    ceiling[i] = bound[i] ?? 0;
+  }
+  ceiling[bumped] = (bound[bumped] ?? 0) + 1;
+  return joinVersion(ceiling);
+}
+
+/** Canonical `=X.Y.Z` pin: every specified component must match exactly. */
+function matchesExactPin(version: string, pin: string): boolean {
+  const bound = parseRangeVersion(pin);
+  if (!bound) return false;
+  // A numeric exact comparator admits releases (build metadata is ignored),
+  // not prereleases or an extra fourth numeric component.
+  const release = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(version);
+  if (!release) return false;
+  return bound.every((component, index) => component === Number(release[index + 1]));
+}
+
+/**
+ * Match one record version against the supported `version_range` subset:
+ * `*`/`x` wildcards, canonical `=X.Y.Z` pins, `^` caret ranges (Cargo
+ * `semver` semantics, including zero-major floors and ceilings), and bare
+ * `X[.Y[.Z]]` prefixes. Tilde, comparator and compound ranges remain
+ * unsupported here and simply do not match.
+ */
+function matchesVersionRange(version: string, range: string): boolean {
   if (range === "*" || range === "x") {
     return true;
+  }
+  if (range.startsWith("=")) {
+    return matchesExactPin(version, range.slice(1));
   }
   if (!range.startsWith("^")) {
     return version === range || version.startsWith(`${range}.`);
   }
-  const [major = 0, minor = 0] = caret
-    .split(".")
-    .map((part) => Number.parseInt(part, 10) || 0);
-  const [vMajorRaw, vMinorRaw = 0, vPatchRaw = 0] = version
-    .split(".")
-    .map((part) => Number.parseInt(part, 10) || 0);
-  const vMajor = vMajorRaw ?? 0;
-  const vMinor = vMinorRaw ?? 0;
-  const vPatch = vPatchRaw ?? 0;
-  if (vMajor !== major) {
+  const bound = parseRangeVersion(range.slice(1));
+  if (!bound) {
     return false;
   }
-  if (major === 0) {
-    return vMinor === minor;
-  }
   return (
-    compareSemver(version, caret) >= 0 &&
-    compareSemver(`${major + 1}.0.0`, version) > 0 &&
-    Number.isFinite(vPatch)
+    compareSemver(version, joinVersion(bound)) >= 0 &&
+    compareSemver(caretCeiling(bound), version) > 0
   );
 }
 
@@ -223,7 +269,7 @@ function selectHighestActive(
     (record) =>
       record.namespace === reference.namespace &&
       record.id === reference.id &&
-      matchesCaretRange(record.version, reference.versionRange),
+      matchesVersionRange(record.version, reference.versionRange),
   );
   const active = matching
     .filter((record) => !record.deprecated)
