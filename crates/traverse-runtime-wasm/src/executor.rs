@@ -12,7 +12,9 @@
 //! not a second implementation of that logic (spec `1402` FR-005).
 
 use traverse_contracts::{EventReference, ServiceType, validate_emit_event};
-use wasmi::{Caller, Config, Engine, Error as WasmiError, Extern, Linker, Module, Store, StoreLimitsBuilder};
+use wasmi::{
+    Caller, Config, Engine, Error as WasmiError, Extern, Linker, Module, Store, StoreLimitsBuilder,
+};
 
 const WASI_ERRNO_SUCCESS: i32 = 0;
 const WASI_ERRNO_BADF: i32 = 8;
