@@ -164,3 +164,73 @@ fn host_driver_runs_real_artifact_and_publishes_a_real_domain_event() {
     let shutdown_response = host.shutdown().expect("traverse_shutdown succeeds");
     assert_eq!(shutdown_response["status"], "stopped");
 }
+
+/// A WASI-command capability that writes its output then calls `proc_exit(0)`
+/// — the exit pattern every real registry capability built against the
+/// shared `wasi-capability-runtime` crate uses (`validation.validate-luhn`,
+/// `doc-approval.analyze`, `report.collect-fragments`), unlike
+/// [`NESTED_CAPABILITY_WAT`] above, which (like `core.calculate-price`) just
+/// returns from `_start` and so never exercised the `proc_exit` path at all.
+/// Before `crates/traverse-runtime-wasm`'s nested `wasi_proc_exit` was fixed
+/// to actually halt execution, a guest reaching `proc_exit` fell through
+/// into a compiler-inserted `unreachable` (the import is declared to
+/// diverge) and `traverse_submit` reported `{"status":"failed",...}` for
+/// every such capability regardless of what it computed — this is the exact
+/// shape of the real incident, driven through the full `RuntimeWasmHost`
+/// pipeline rather than a synthetic unit-level fixture.
+const PROC_EXIT_CAPABILITY_WAT: &str = r#"
+  (module
+    (import "wasi_snapshot_preview1" "fd_read"
+      (func $fd_read (param i32 i32 i32 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "fd_write"
+      (func $fd_write (param i32 i32 i32 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (param i32)))
+    (memory (export "memory") 1)
+    (data (i32.const 5000) "{\"valid\":true}")
+    (func (export "_start")
+      (i32.store (i32.const 0) (i32.const 5000))
+      (i32.store (i32.const 4) (i32.const 14))
+      (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 100)))
+      (call $proc_exit (i32.const 0))
+    )
+  )
+"#;
+
+#[test]
+fn host_driver_completes_a_real_artifact_that_exits_via_proc_exit() {
+    let runtime_wasm_bytes =
+        std::fs::read(build_runtime_wasm_artifact()).expect("read built runtime.wasm");
+    let nested_capability = wat::parse_str(PROC_EXIT_CAPABILITY_WAT).expect("wat parses");
+
+    let mut host =
+        RuntimeWasmHost::instantiate(&runtime_wasm_bytes).expect("instantiate runtime.wasm");
+
+    let init_response = host
+        .init(
+            CapabilityInit {
+                capability_id: "example.proc-exit-smoke",
+                capability_version: "1.0.0",
+                service_type: &ServiceType::Stateless,
+                declared_emits: &[],
+                host_placement_target: &ExecutionTarget::Local,
+                permitted_targets: &[ExecutionTarget::Local],
+            },
+            &nested_capability,
+        )
+        .expect("traverse_init succeeds");
+    assert_eq!(init_response["status"], "ready");
+
+    host.submit(b"{}").expect("traverse_submit succeeds");
+
+    let events = host.drain_events().expect("drain events");
+    let result = events
+        .iter()
+        .find(|event| event["type"] == "capability_result")
+        .expect("a capability_result event must be emitted");
+    assert_eq!(
+        result["data"]["status"], "completed",
+        "a capability that exits via proc_exit(0) after writing output must \
+         complete, not fail with an unrelated trap: {result:?}"
+    );
+    assert_eq!(result["data"]["output"], json!({"valid": true}));
+}

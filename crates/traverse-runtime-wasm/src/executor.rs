@@ -12,13 +12,27 @@
 //! not a second implementation of that logic (spec `1402` FR-005).
 
 use traverse_contracts::{EventReference, ServiceType, validate_emit_event};
-use wasmi::{Caller, Config, Engine, Extern, Linker, Module, Store, StoreLimitsBuilder};
+use wasmi::{Caller, Config, Engine, Error as WasmiError, Extern, Linker, Module, Store, StoreLimitsBuilder};
 
 const WASI_ERRNO_SUCCESS: i32 = 0;
 const WASI_ERRNO_BADF: i32 = 8;
 const WASI_ERRNO_INVAL: i32 = 28;
 const FUEL: u64 = 10_000_000;
-const MAX_MEMORY_BYTES: usize = 16 * 1024 * 1024;
+/// Real registry capabilities built against the shared `wasi-capability-
+/// runtime` crate (e.g. `validation.validate-luhn`, `doc-approval.analyze`,
+/// `report.collect-fragments`) declare a static bump-allocator heap as part
+/// of their linear memory, currently 192 MiB (registry `capability-src/
+/// wasi-capability-runtime/src/lib.rs`, registry#473) -- their compiled
+/// module's declared *minimum* memory already reserves that whole region at
+/// instantiation, before any code runs. The previous 16 MiB ceiling here
+/// denied instantiation outright for those artifacts (`report.collect-
+/// fragments` specifically: "failed to instantiate memory: a resource
+/// limiter denied to allocate or grow the linear memory"). 256 MiB admits
+/// the current 192 MiB shim heap plus headroom for stack/globals, mirroring
+/// why the native `WasmExecutor`'s own memory ceiling
+/// (`crates::executor::wasm::DEFAULT_MEMORY_LIMIT_BYTES`) was raised for the
+/// same class of problem (issue #1336).
+const MAX_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 
 /// One capability-declared event, accepted by the shared validation core
 /// during a nested execution. The caller (`lib.rs`) turns these into
@@ -161,9 +175,22 @@ fn wasi_fd_write(
     WASI_ERRNO_SUCCESS
 }
 
-fn wasi_proc_exit(_caller: Caller<'_, NestedStoreState>, _code: i32) {
-    // Matches the native executor: a non-zero guest exit does not itself
-    // fail the host call — the caller inspects stdout/exit status separately.
+/// WASI's `proc_exit` never returns to its caller (real implementations
+/// terminate the process outright). A wasm32 command binary's compiler
+/// relies on that contract: since the import is declared to diverge, LLVM
+/// emits no code to handle it returning — the instruction immediately after
+/// the call is an `unreachable` trap. A host implementation that just
+/// returns `()` (as this one used to) therefore falls straight into that
+/// trap on every guest that actually calls `proc_exit`, including on the
+/// ordinary success path (`wasi-capability-runtime`'s `run_capability` always
+/// calls it, even for `exit(0)`), surfacing as an opaque "wasm unreachable
+/// instruction executed" failure instead of a result.
+/// Returning `Err(wasmi::Error::i32_exit(code))` halts execution the way a
+/// real `proc_exit` would — mirroring the native Wasmtime executor's
+/// `wasmtime_wasi::I32Exit`, which `execute_nested_capability` unwraps the
+/// same way: status `0` is success, anything else is a failure.
+fn wasi_proc_exit(_caller: Caller<'_, NestedStoreState>, code: i32) -> Result<(), WasmiError> {
+    Err(WasmiError::i32_exit(code))
 }
 
 /// `traverse_host::emit_event` as seen by the *nested* capability — same
@@ -245,9 +272,15 @@ pub fn execute_nested_capability(
     let start = instance
         .get_typed_func::<(), ()>(&store, "_start")
         .map_err(|error| format!("missing _start: {error}"))?;
-    start
-        .call(&mut store, ())
-        .map_err(|error| format!("execution: {error}"))?;
+    if let Err(error) = start.call(&mut store, ()) {
+        // A guest that calls `proc_exit` surfaces here as an `i32_exit`
+        // (see `wasi_proc_exit`) rather than a normal return — status `0`
+        // is the command's successful completion, exactly like the native
+        // executor's `wasmtime_wasi::I32Exit` handling.
+        if error.i32_exit_status() != Some(0) {
+            return Err(format!("execution: {error}"));
+        }
+    }
 
     let final_state = store.into_data();
     Ok(NestedExecutionOutcome {
@@ -407,6 +440,107 @@ mod tests {
           )
         "#;
         let artifact = wat::parse_str(BAD_FD_WRITE_WAT).map_err(|error| format!("wat: {error}"))?;
+        let outcome =
+            execute_nested_capability(&artifact, b"{}", &ServiceType::Subscribable, &declared())?;
+        assert!(outcome.stdout.is_empty());
+        Ok(())
+    }
+
+    /// Regression test for the real registry incident this module's
+    /// `wasi_proc_exit`/memory-ceiling fixes were built for: real
+    /// capabilities compiled against the shared `wasi-capability-runtime`
+    /// crate (`validation.validate-luhn`, `doc-approval.analyze`,
+    /// `report.collect-fragments`) always call `proc_exit` at the end of
+    /// `_start`, even on the ordinary success path — unlike the other
+    /// fixtures in this module, which just return from `_start` normally
+    /// (matching `core.calculate-price`'s style, which is why that
+    /// capability alone was unaffected). Before the fix, a guest reaching
+    /// `proc_exit` fell through into a compiler-inserted `unreachable`
+    /// (the import is declared to diverge, so nothing follows the call) and
+    /// this always failed with an opaque "wasm unreachable instruction
+    /// executed" trap, no matter what the capability actually computed.
+    const WRITE_THEN_PROC_EXIT_ZERO_WAT: &str = r#"
+      (module
+        (import "wasi_snapshot_preview1" "fd_write"
+          (func $fd_write (param i32 i32 i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (param i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 5000) "{\"valid\":true}")
+        (func (export "_start")
+          (i32.store (i32.const 0) (i32.const 5000))
+          (i32.store (i32.const 4) (i32.const 14))
+          (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 100)))
+          (call $proc_exit (i32.const 0))
+        )
+      )
+    "#;
+
+    #[test]
+    fn capability_calling_proc_exit_zero_after_output_succeeds() -> Result<(), String> {
+        let artifact = wat::parse_str(WRITE_THEN_PROC_EXIT_ZERO_WAT)
+            .map_err(|error| format!("wat: {error}"))?;
+        let outcome =
+            execute_nested_capability(&artifact, b"{}", &ServiceType::Subscribable, &declared())?;
+        assert_eq!(outcome.stdout, br#"{"valid":true}"#);
+        Ok(())
+    }
+
+    /// A guest that fails closed via `proc_exit(1)` (mirroring `wasi-
+    /// capability-runtime`'s panic handler, which calls `wasi::exit(2)`)
+    /// must surface as a distinguishable execution failure — not silently
+    /// succeed (the old no-op host stub) and not report the unrelated
+    /// `unreachable` trap the missing-halt bug produced for every guest
+    /// exit, success or failure alike.
+    const PROC_EXIT_NONZERO_WAT: &str = r#"
+      (module
+        (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (param i32)))
+        (memory (export "memory") 1)
+        (func (export "_start")
+          (call $proc_exit (i32.const 2))
+        )
+      )
+    "#;
+
+    #[test]
+    fn capability_calling_proc_exit_nonzero_is_a_distinct_execution_failure() -> Result<(), String>
+    {
+        let artifact =
+            wat::parse_str(PROC_EXIT_NONZERO_WAT).map_err(|error| format!("wat: {error}"))?;
+        let result =
+            execute_nested_capability(&artifact, b"{}", &ServiceType::Subscribable, &declared());
+        let Err(error) = result else {
+            return Err("non-zero proc_exit must fail the call".to_string());
+        };
+        if error.contains("unreachable") {
+            return Err(format!(
+                "must not be misreported as the unrelated unreachable trap: {error}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Regression test for the other half of the same incident:
+    /// `report.collect-fragments` failed at *instantiation* ("failed to
+    /// instantiate memory: a resource limiter denied to allocate or grow
+    /// the linear memory") because real capabilities built against the
+    /// shared `wasi-capability-runtime` crate declare a static
+    /// bump-allocator heap as part of their linear memory (192 MiB as of
+    /// registry#473) -- comfortably past the old 16 MiB ceiling. 300 pages
+    /// (~19.3 MiB) exceeds that old ceiling while staying well under the
+    /// current one, proving the cap was actually raised rather than the
+    /// module coincidentally fitting.
+    const LARGE_INITIAL_MEMORY_WAT: &str = r#"
+      (module
+        (memory (export "memory") 300)
+        (func (export "_start"))
+      )
+    "#;
+
+    #[test]
+    fn capability_with_memory_above_the_old_sixteen_mebibyte_ceiling_instantiates()
+    -> Result<(), String> {
+        let artifact =
+            wat::parse_str(LARGE_INITIAL_MEMORY_WAT).map_err(|error| format!("wat: {error}"))?;
         let outcome =
             execute_nested_capability(&artifact, b"{}", &ServiceType::Subscribable, &declared())?;
         assert!(outcome.stdout.is_empty());
