@@ -470,3 +470,23 @@ test("a throwing subscriber stays visible and dispatch recovers in order", () =>
     ["started", "stopped"],
   );
 });
+
+test("throwing during late replay keeps the subscription and resumes without redelivery", () => {
+  const embedder = compatibleEmbedder();
+  embedder.startCompatible("fixture.render", {});
+
+  const failing = [];
+  assert.throws(() => {
+    embedder.subscribe((event) => {
+      failing.push(event.sequence);
+      if (event.sequence === 1) {
+        throw new Error("replay failure");
+      }
+    });
+  }, /replay failure/);
+
+  assert.deepEqual(failing, [1]);
+
+  assert.equal(embedder.stopCompatible("fixture.render").status, "stopped");
+  assert.deepEqual(failing, [1, 2]);
+});
