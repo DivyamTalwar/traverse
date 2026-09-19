@@ -4784,3 +4784,68 @@ reusing `capability_*` events for connectors.
 Approved by Enrico in `/brainstorm` session (2026-09-18); each recommendation
 accepted as given (`ok`). Spec 139 and ADR-0075 are Approved under this
 decision.
+
+## Decision 97: Host Authorities Are Target-Neutral, WIT-Defined, and Runtime-Owned (Generic Rules)
+
+- **Date**: 2026-09-18
+- **Status**: Accepted
+- **Governing specs**: amendments to `1259-portable-authority-contracts`
+  (the "native-only" classification), `137-host-connector-command-dispatch`
+  (target rule and Spec 135 exclusion), `138-governed-exact-model-execution`
+  (host staging generalised beyond model input); builds on
+  `139-embedder-app-state-machine-execution`
+- **Related issues**: `#1471` (re-scoped by this decision), `#1468`, `#1370`
+  (separate)
+- **Origin**: downstream standalone-app request; `/brainstorm` challenge that
+  these are project-wide rules, not app, capability, or target choices.
+  `traverse.audio-input` is the first authority to apply them, not their scope.
+
+### Context
+
+Spec 1259 classed `traverse.audio-input` as native-only and Spec 137 rejects a
+`browser` target for it. ADR-0060 records no technical limit, only a non-goal
+of emulating native authority in the browser. The Spec 137 envelope is already
+target-neutral. Per-target authority contracts force per-target manifests and
+break shared state-machine parity.
+
+### Decision (general rules)
+
+1. **One generic contract per authority.** A host authority (connector) has a
+   single target-neutral ID and envelope. There are no per-OS, per-browser, or
+   per-app variants of the same authority. A binding declares which targets it
+   supports; a target with no activated adapter fails closed with
+   `target_incompatible`. "Native-only" is not a contract classification.
+2. **WIT defines every host-adapter interface.** The interface a host adapter
+   implements is expressed in WIT so every target implements the same shape.
+   The public command/result/event contract stays the Spec 137 JSON envelope.
+   Guests still gain no authority through it.
+3. **Permissioned authorities expose an explicit permission step** in their
+   WIT interface so the runtime-owned state machine can declare a permission
+   wait with its own failure route. Target-specific gesture or permission
+   tokens never enter the public envelope.
+4. **Host-produced artifacts use Spec 138 host staging.** Adapters write to
+   host-owned staging and return an opaque reference; capabilities read only by
+   that reference. New authorities do not introduce their own storage unless a
+   separate approved contract does.
+5. **Work is scoped by generic contract, not by platform.** No "target A first,
+   target B later" releases. A blocker tied to one target's tooling or evidence
+   is recorded as a separate constraint, not as a scope decision.
+
+Applied first to `traverse.audio-input` / `audio.capture`, which therefore
+becomes available on any target that supplies an adapter.
+
+### Alternatives considered
+
+Per-target connector IDs (breaks shared manifests); keeping a native-only class
+with host-injected artifact refs (splits state-machine ownership, rejected by
+ADR-0075); permission handling hidden inside the operation (non-deterministic
+denial); gesture tokens in the envelope (leaks target concepts); an unapproved
+object-store authority on the critical path; WIT replacing the Spec 137
+envelope end to end; platform-sequenced releases.
+
+### Approval
+
+Approved by Enrico in `/brainstorm` (2026-09-18): one generic capability plus
+WIT; WIT for the host-adapter interface; explicit permission step; Spec 138
+staging; generic, not platform-split, scope. Recast as project-wide rules at
+Enrico's direction.
