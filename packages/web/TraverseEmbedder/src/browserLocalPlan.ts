@@ -95,7 +95,8 @@ export async function browserLocalPlan(identity: BrowserSnapshotIdentity, snapsh
     const inputs = required(record(contract.inputs)?.schema); const outputs = fields(record(contract.outputs)?.schema);
     const emits = Array.isArray(contract.emits) ? contract.emits.flatMap(v => { const e = record(v); return typeof e?.event_id === "string" ? [e.event_id] : []; }) : [];
     return { id: found.id, version: found.version, digest: found.digest, inputs, outputs, emits };
-  }).sort((a,b) => a.id.localeCompare(b.id) || a.version.localeCompare(b.version));
+  }).sort((a,b) => a.id.localeCompare(b.id) || a.version.localeCompare(b.version))
+    .filter((candidate, index, all) => index === 0 || candidate.id !== all[index - 1]!.id || candidate.version !== all[index - 1]!.version);
   // Starting facts are values, unlike contract schemas; their own keys form
   // the initial structural output set. Chain search MUST match Rust
   // `build_chains` in `browser_local_plan.rs`: the base case is against
@@ -105,8 +106,21 @@ export async function browserLocalPlan(identity: BrowserSnapshotIdentity, snapsh
   const facts = Object.keys(record(startingFacts) ?? {}).sort();
   const targets = declared.filter(c => (target.capability_id !== undefined && target.capability_version !== undefined && c.id === target.capability_id && c.version === target.capability_version) || (target.emits_event !== undefined && c.emits.includes(target.emits_event)));
   const chains: Declared[][] = [];
+  // Truncation must mean "candidates were excluded" (issue #1477). The search
+  // therefore keeps going until it has seen one chain more than the candidate
+  // bound, and separately records the eight-node depth cutoff, mirroring Rust
+  // `build_chains`: it flags truncation only when `all_chains.len()` exceeds
+  // PLAN_MAX_CANDIDATES or an edge is skipped at `remaining_budget <= 1`.
+  const searchBound = BROWSER_PLAN_MAX_CANDIDATES + 1;
+  let depthTruncated = false;
+  let workTruncated = false;
+  // Same defensive work bound as native PLAN_MAX_SEARCH_CALLS. Looking for
+  // a sixth candidate must not exhaust an exponentially large dead graph.
+  let searchCallsRemaining = 4_000;
   const visit = (node: Declared, chain: Declared[]): void => {
-    if (chains.length >= BROWSER_PLAN_MAX_CANDIDATES || chain.length >= BROWSER_PLAN_MAX_NODES) return;
+    if (chains.length >= searchBound) return;
+    if (searchCallsRemaining === 0) { workTruncated = true; return; }
+    searchCallsRemaining -= 1;
     // Base case: covered by starting facts only — never by this node's outputs.
     if (node.inputs.every(field => facts.includes(field))) {
       chains.push([...chain, node]);
@@ -114,9 +128,13 @@ export async function browserLocalPlan(identity: BrowserSnapshotIdentity, snapsh
     // Empty required inputs never gain predecessors (vacuous cover would invent edges).
     if (node.inputs.length === 0) return;
     for (const predecessor of declared) {
+      if (chains.length >= searchBound) return;
       if (predecessor === node || chain.includes(predecessor)) continue;
       // Predecessor outputs alone must cover this node's required inputs.
       if (!node.inputs.every(field => predecessor.outputs.includes(field))) continue;
+      // The predecessor would be node number `chain.length + 2`; refusing it at
+      // the bound is a real exclusion, so report it rather than hide it.
+      if (chain.length + 1 >= BROWSER_PLAN_MAX_NODES) { depthTruncated = true; continue; }
       visit(predecessor, [...chain, node]);
     }
   };
@@ -133,5 +151,5 @@ export async function browserLocalPlan(identity: BrowserSnapshotIdentity, snapsh
     }
     return { kind: "browser_workflow_proposal" as const, schema_version: BROWSER_WORKFLOW_PROPOSAL_SCHEMA_VERSION, snapshot_digest: identity.registry_snapshot_digest, source_release: identity.source_release, mapping_unconfirmed: true, proposal: { kind: "workflow_proposal" as const, schema_version: "1.0.0", proposal_id: `browser-plan-${index + 1}`, workspace_id: workspaceId, app_manifest: appManifest, nodes, edges: nodes.slice(1).map((node,n) => ({ from_node_id: nodes[n]!.node_id, to_node_id: node.node_id })), mappings, initial_input: startingFacts } };
   });
-  return { proposals, plan_search_truncated: chains.length >= BROWSER_PLAN_MAX_CANDIDATES };
+  return { proposals, plan_search_truncated: chains.length > BROWSER_PLAN_MAX_CANDIDATES || depthTruncated || workTruncated };
 }

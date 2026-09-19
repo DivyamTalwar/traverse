@@ -96,7 +96,116 @@ test("browser planner keeps forwarding intermediate nodes in end-to-end chains",
   );
 });
 
+// Regression for #1477: `plan_search_truncated` must mean "candidates were
+// excluded", matching the native `build_chains` bounds in
+// `crates/traverse-embedder/src/browser_local_plan.rs` (more than five chains,
+// or an edge skipped because it would need a ninth node).
+const marker = (index) => String.fromCharCode(97 + (index % 26)).repeat(2) + String(index);
+function graph(nodes) {
+  const snapshot = {
+    releaseTag: "registry-v1",
+    capabilities: nodes.map((node, index) => ({ namespace: "bounds", id: node.id, version: "1.0.0", digest: digest(marker(index)), artifactUrl: "", contractDigest: "", contractUrl: "", deprecated: false })),
+  };
+  const identity = { registry_snapshot_digest: sha(snapshot), source_release: snapshot.releaseTag, contract_schema_version: "1.0.0" };
+  const dependencies = nodes.map((node, index) => ({
+    wasmBytes: new Uint8Array(),
+    contractBytes: new TextEncoder().encode(JSON.stringify(contract(node.id, node.inputs, node.outputs))),
+    wasmDigest: digest(marker(index)),
+    evidence: { namespace: "bounds", id: node.id, selectedVersion: "1.0.0", versionRange: "1.0.0", sourceRelease: "registry-v1", indexDigest: identity.registry_snapshot_digest, artifactDigest: digest(marker(index)), verifiedAt: 1, outcome: "prepared" },
+  }));
+  return { snapshot, identity, dependencies };
+}
+const plan = (nodes, targetId, facts) => {
+  const { snapshot, identity, dependencies } = graph(nodes);
+  return browserLocalPlan(identity, snapshot, dependencies, { capability_id: targetId, capability_version: "1.0.0" }, facts, "local", { app_id: "bounds" });
+};
+// `producers` distinct capabilities each turn the starting fact into the sink's
+// single required input, so the candidate count equals the producer count.
+const producerGraph = (producers) => [
+  { id: "sink", inputs: ["middle"], outputs: ["result"] },
+  ...Array.from({ length: producers }, (_value, index) => ({ id: `producer-${index + 1}`, inputs: ["seed"], outputs: ["middle"] })),
+];
+
+for (const producers of [0, 1, 4, 5]) {
+  test(`browser planner reports no truncation when ${producers} producers all fit the five-plan bound`, async () => {
+    const result = await plan(producerGraph(producers), "sink", { seed: "x" });
+    assert.equal(result.proposals.length, producers);
+    assert.equal(result.plan_search_truncated, false);
+  });
+}
+
+test("browser planner reports truncation and keeps five plans when a sixth producer exists", async () => {
+  const result = await plan(producerGraph(6), "sink", { seed: "x" });
+  assert.equal(result.proposals.length, 5);
+  assert.equal(result.plan_search_truncated, true);
+});
+
+test("browser planner returns a deterministic five-plan prefix when bounded", async () => {
+  const nodes = producerGraph(6);
+  const first = await plan(nodes, "sink", { seed: "x" });
+  const second = await plan(nodes, "sink", { seed: "x" });
+  assert.deepEqual(first, second);
+  assert.deepEqual(
+    first.proposals.map((proposal) => proposal.proposal.nodes[0].capability_id),
+    ["producer-1", "producer-2", "producer-3", "producer-4", "producer-5"],
+  );
+});
+
+// Chain of `length` capabilities: capability n consumes `f{n-1}` and emits
+// `f{n}`, so only the full chain reaches the target from `{ f0 }`.
+const chainGraph = (length) => Array.from({ length }, (_value, index) => ({ id: `step-${index + 1}`, inputs: [`f${index}`], outputs: [`f${index + 1}`] }));
+
+test("browser planner returns an exactly eight-node chain without reporting truncation", async () => {
+  const result = await plan(chainGraph(8), "step-8", { f0: "x" });
+  assert.equal(result.proposals.length, 1);
+  assert.equal(result.proposals[0].proposal.nodes.length, 8);
+  assert.equal(result.plan_search_truncated, false);
+});
+
+test("browser planner reports truncation when a chain needs a ninth node", async () => {
+  const result = await plan(chainGraph(9), "step-9", { f0: "x" });
+  assert.equal(result.proposals.length, 0);
+  assert.equal(result.plan_search_truncated, true);
+});
+
+test("browser planner terminates on a cyclic producer pair and reports it truthfully", async () => {
+  const nodes = [
+    { id: "sink", inputs: ["kb"], outputs: ["result"] },
+    { id: "cycle-a", inputs: ["ka"], outputs: ["kb"] },
+    { id: "cycle-b", inputs: ["kb"], outputs: ["ka"] },
+  ];
+  const unreachable = await plan(nodes, "sink", {});
+  assert.equal(unreachable.proposals.length, 0);
+  assert.equal(unreachable.plan_search_truncated, false);
+  const reachable = await plan(nodes, "sink", { ka: "x" });
+  assert.deepEqual(reachable.proposals.map((proposal) => proposal.proposal.nodes.map((node) => node.capability_id)), [["cycle-a", "sink"]]);
+  assert.equal(reachable.plan_search_truncated, false);
+});
+
 test("browser planner fails closed before planning on altered snapshot evidence", async () => {
   const { snapshot, identity, dependencies } = inputs();
   await assert.rejects(() => browserLocalPlan({ ...identity, registry_snapshot_digest: digest("z") }, snapshot, dependencies, { capability_id: "sink", capability_version: "1.0.0" }, {}, "local", {}), (error) => error instanceof BrowserPlanError && error.code === "browser_plan_snapshot_digest_mismatch");
+});
+
+
+test("browser planner counts each prepared capability identity only once", async () => {
+  const { snapshot, identity, dependencies } = graph(producerGraph(3));
+  const result = await browserLocalPlan(identity, snapshot, [...dependencies, ...dependencies],
+    { capability_id: "sink", capability_version: "1.0.0" }, { seed: "x" }, "local", {});
+  assert.equal(result.proposals.length, 3);
+  assert.equal(result.plan_search_truncated, false);
+});
+
+test("browser planner reports its search-call bound in a large dead search", async () => {
+  const nodes = [{ id: "sink", inputs: ["f6"], outputs: ["result"] }];
+  for (let level = 1; level <= 6; level += 1) {
+    for (let branch = 0; branch < 4; branch += 1) {
+      nodes.push({ id: `level-${level}-${branch}`, inputs: [`f${level - 1}`], outputs: [`f${level}`] });
+    }
+  }
+  // 4^6 possible dead paths, all shorter than the depth cap: only the
+  // native-equivalent 4000-call work budget should mark this truncated.
+  const result = await plan(nodes, "sink", {});
+  assert.equal(result.proposals.length, 0);
+  assert.equal(result.plan_search_truncated, true);
 });
