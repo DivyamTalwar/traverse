@@ -351,6 +351,146 @@ test("artifact digest verification accepts matching bytes and rejects mismatches
   );
 });
 
+// Ordered reentrant event dispatch (spec 068 FR-004/FR-006).
+
+function compatibleEmbedder() {
+  return new EmbedderTestDouble({ platform: "web" }).withCompatibleTarget(
+    "fixture.render",
+    ["web"],
+  );
+}
+
+function recorder(embedder, sink, onEvent) {
+  embedder.subscribe((event) => {
+    sink.push(event);
+    if (onEvent !== undefined) {
+      onEvent(event);
+    }
+  });
+  return sink;
+}
+
+const sequences = (events) => events.map((event) => event.sequence);
+
+const startedEvent = (event) =>
+  event.event_type === "state_changed" && event.data.state === "started";
+
+test("reentrant lifecycle emission keeps every live subscriber in ascending order", () => {
+  const embedder = compatibleEmbedder();
+  const first = recorder(embedder, [], (event) => {
+    if (startedEvent(event)) {
+      embedder.stopCompatible("fixture.render");
+    }
+  });
+  const second = recorder(embedder, []);
+
+  const started = embedder.startCompatible("fixture.render", { surface: "dom" });
+  assert.equal(started.status, "started");
+
+  assert.deepEqual(sequences(first), [1, 2]);
+  assert.deepEqual(sequences(second), [1, 2]);
+  assert.deepEqual(first[0].data.input, { surface: "dom" });
+  assert.deepEqual(
+    second.map((event) => event.data.state),
+    ["started", "stopped"],
+  );
+  assert.equal(second[1].data.previous_state, "started");
+});
+
+test("late replay subscriber observes the same ascending order after reentrant emission", () => {
+  const embedder = compatibleEmbedder();
+  recorder(embedder, [], (event) => {
+    if (startedEvent(event)) {
+      embedder.stopCompatible("fixture.render");
+    }
+  });
+  embedder.startCompatible("fixture.render", {});
+
+  const late = recorder(embedder, []);
+  assert.deepEqual(sequences(late), [1, 2]);
+  assert.deepEqual(
+    late.map((event) => event.data.state),
+    ["started", "stopped"],
+  );
+});
+
+test("subscribing during a notification replays history before newer events", () => {
+  const embedder = compatibleEmbedder();
+  const joined = [];
+  recorder(embedder, [], (event) => {
+    if (startedEvent(event) && joined.length === 0) {
+      recorder(embedder, joined);
+      embedder.stopCompatible("fixture.render");
+    }
+  });
+
+  embedder.startCompatible("fixture.render", {});
+  assert.deepEqual(sequences(joined), [1, 2]);
+
+  embedder.startCompatible("fixture.render", {});
+  assert.deepEqual(sequences(joined), [1, 2, 3]);
+});
+
+test("emitting during replay keeps replay and live subscribers ascending", () => {
+  const embedder = compatibleEmbedder();
+  const live = recorder(embedder, []);
+  embedder.startCompatible("fixture.render", {});
+
+  let emittedDuringReplay = false;
+  const replay = recorder(embedder, [], (event) => {
+    if (event.sequence === 1 && !emittedDuringReplay) {
+      emittedDuringReplay = true;
+      embedder.stopCompatible("fixture.render");
+    }
+  });
+
+  assert.equal(emittedDuringReplay, true);
+  assert.deepEqual(sequences(replay), [1, 2]);
+  assert.deepEqual(sequences(live), [1, 2]);
+});
+
+test("a throwing subscriber stays visible and dispatch recovers in order", () => {
+  const embedder = compatibleEmbedder();
+  const failing = [];
+  embedder.subscribe((event) => {
+    failing.push(event.sequence);
+    if (event.sequence === 1) {
+      throw new Error("subscriber failure");
+    }
+  });
+  const healthy = recorder(embedder, []);
+
+  assert.throws(() => embedder.startCompatible("fixture.render", {}), /subscriber failure/);
+
+  assert.equal(embedder.stopCompatible("fixture.render").status, "stopped");
+  assert.deepEqual(failing, [1, 2]);
+  assert.deepEqual(sequences(healthy), [1, 2]);
+  assert.deepEqual(
+    healthy.map((event) => event.data.state),
+    ["started", "stopped"],
+  );
+});
+
+test("throwing during late replay keeps the subscription and resumes without redelivery", () => {
+  const embedder = compatibleEmbedder();
+  embedder.startCompatible("fixture.render", {});
+
+  const failing = [];
+  assert.throws(() => {
+    embedder.subscribe((event) => {
+      failing.push(event.sequence);
+      if (event.sequence === 1) {
+        throw new Error("replay failure");
+      }
+    });
+  }, /replay failure/);
+
+  assert.deepEqual(failing, [1]);
+
+  assert.equal(embedder.stopCompatible("fixture.render").status, "stopped");
+  assert.deepEqual(failing, [1, 2]);
+});
+
 test("embedder-api 1.1.0: test double accepts app_command envelopes", () => {
   const double = new EmbedderTestDouble()
     .withTargetOutput("app_command:submit", { ok: true });

@@ -175,3 +175,10 @@ crate test fixtures) and runs `BundleEmbedder` against them — including one
 test that loads and executes the real, checked-in `examples/applications/traverse-starter`
 bundle end to end — so the browser execution engine is exercised for real,
 not mocked.
+
+### Reentrant event subscriptions
+
+`subscribe` replays retained events synchronously outside event callbacks.
+Inside a callback, replay waits until the active dispatch drains; each subscriber
+still receives events in ascending sequence order. Callback exceptions remain
+visible to the caller. A later emission or subscription resumes pending deliveries.
