@@ -13,6 +13,8 @@ pub struct FakeHostConnector {
     unavailable: bool,
     leaky: bool,
     cancel_on_invoke: bool,
+    empty_artifact: bool,
+    permission_state: Option<HostConnectorPermissionState>,
 }
 
 impl FakeHostConnector {
@@ -22,6 +24,7 @@ impl FakeHostConnector {
         Self {
             next_audio_id: 1,
             next_model_id: 1,
+            permission_state: Some(HostConnectorPermissionState::Granted),
             ..Self::default()
         }
     }
@@ -44,6 +47,21 @@ impl FakeHostConnector {
     /// Force a host-private artifact reference so dispatch must redact it.
     pub fn leak_artifact(&mut self, leaky: bool) {
         self.leaky = leaky;
+    }
+
+    /// Force an empty artifact reference on capture/model success.
+    pub fn set_empty_artifact(&mut self, empty: bool) {
+        self.empty_artifact = empty;
+    }
+
+    /// Set the permission outcome returned for `audio.permission.request`.
+    pub fn set_permission_state(&mut self, state: HostConnectorPermissionState) {
+        self.permission_state = Some(state);
+    }
+
+    /// Clear the permission outcome so the adapter returns no `permission_state`.
+    pub fn clear_permission_state(&mut self) {
+        self.permission_state = None;
     }
 
     /// Number of adapter invokes (idempotent replay must not increment this).
@@ -84,9 +102,22 @@ impl HostConnectorPort for FakeHostConnector {
                 message: "host connector is unavailable".to_string(),
             });
         }
+        if request.operation == AUDIO_PERMISSION_REQUEST_OPERATION {
+            return Ok(HostConnectorHostResult {
+                artifact_ref: None,
+                permission_state: self.permission_state,
+            });
+        }
         if self.leaky {
             return Ok(HostConnectorHostResult {
-                artifact_ref: "microphone:/tmp/capture.wav".to_string(),
+                artifact_ref: Some("microphone:/tmp/capture.wav".to_string()),
+                permission_state: None,
+            });
+        }
+        if self.empty_artifact {
+            return Ok(HostConnectorHostResult {
+                artifact_ref: Some(String::new()),
+                permission_state: None,
             });
         }
         let artifact_ref = if request.operation == AUDIO_CAPTURE_OPERATION {
@@ -98,7 +129,10 @@ impl HostConnectorPort for FakeHostConnector {
             self.next_model_id += 1;
             format!("model-ref-{id}")
         };
-        Ok(HostConnectorHostResult { artifact_ref })
+        Ok(HostConnectorHostResult {
+            artifact_ref: Some(artifact_ref),
+            permission_state: None,
+        })
     }
 }
 
@@ -126,11 +160,61 @@ fn audio_manifest() -> HostConnectorAppManifest {
     HostConnectorAppManifest {
         app_id: "callweave.recording".to_string(),
         connector_bindings: vec![audio_binding()],
-        command_routes: vec![HostConnectorCommandRoute {
-            command: "capture_audio".to_string(),
-            connector_id: AUDIO_INPUT_CONNECTOR.to_string(),
-            operation: AUDIO_CAPTURE_OPERATION.to_string(),
-        }],
+        command_routes: vec![
+            HostConnectorCommandRoute {
+                command: "capture_audio".to_string(),
+                connector_id: AUDIO_INPUT_CONNECTOR.to_string(),
+                operation: AUDIO_CAPTURE_OPERATION.to_string(),
+            },
+            HostConnectorCommandRoute {
+                command: "request_permission".to_string(),
+                connector_id: AUDIO_INPUT_CONNECTOR.to_string(),
+                operation: AUDIO_PERMISSION_REQUEST_OPERATION.to_string(),
+            },
+        ],
+    }
+}
+
+fn browser_audio_binding() -> HostConnectorBinding {
+    HostConnectorBinding {
+        binding_id: "default-browser-audio".to_string(),
+        connector_id: AUDIO_INPUT_CONNECTOR.to_string(),
+        version: "1.0.0".to_string(),
+        config_ref: "audio-authority".to_string(),
+        placement_targets: vec!["browser".to_string()],
+    }
+}
+
+fn browser_audio_manifest() -> HostConnectorAppManifest {
+    HostConnectorAppManifest {
+        app_id: "callweave.recording".to_string(),
+        connector_bindings: vec![browser_audio_binding()],
+        command_routes: vec![
+            HostConnectorCommandRoute {
+                command: "capture_audio".to_string(),
+                connector_id: AUDIO_INPUT_CONNECTOR.to_string(),
+                operation: AUDIO_CAPTURE_OPERATION.to_string(),
+            },
+            HostConnectorCommandRoute {
+                command: "request_permission".to_string(),
+                connector_id: AUDIO_INPUT_CONNECTOR.to_string(),
+                operation: AUDIO_PERMISSION_REQUEST_OPERATION.to_string(),
+            },
+        ],
+    }
+}
+
+fn permission_command(target_family: &str) -> HostConnectorAppCommand {
+    HostConnectorAppCommand {
+        kind: COMMAND_KIND.to_string(),
+        schema_version: SCHEMA_VERSION.to_string(),
+        command: "request_permission".to_string(),
+        command_id: "cmd-permission-1".to_string(),
+        correlation_id: "corr-permission-1".to_string(),
+        idempotency_key: "idem-permission-1".to_string(),
+        target_family: target_family.to_string(),
+        cancel_requested: false,
+        payload: json!({}),
     }
 }
 
@@ -351,7 +435,8 @@ fn missing_incompatible_unconfigured_and_unactivated_bindings_fail_before_host()
 }
 
 #[test]
-fn browser_rejects_native_audio_with_shared_event_contract() -> Result<(), String> {
+fn undeclared_target_family_fails_target_incompatible_with_shared_event_contract()
+-> Result<(), String> {
     let activations = activated_audio();
     let mut host = FakeHostConnector::new();
     let mut idempotency = HostConnectorIdempotencyStore::new();
@@ -371,6 +456,179 @@ fn browser_rejects_native_audio_with_shared_event_contract() -> Result<(), Strin
     assert_eq!(failed.dispatch.events[0].schema_version, SCHEMA_VERSION);
     assert_eq!(host.invoke_count(), 0);
     assert_no_leak(&json!(failed.dispatch));
+    Ok(())
+}
+
+#[test]
+fn browser_audio_succeeds_when_binding_declares_browser() -> Result<(), String> {
+    let mut activations = HostConnectorActivationSet::new();
+    activations.activate("default-browser-audio");
+    let mut host = FakeHostConnector::new();
+    let mut idempotency = HostConnectorIdempotencyStore::new();
+    let dispatch = require_ok(
+        &audio_command("browser"),
+        &browser_audio_manifest(),
+        &activations,
+        &mut host,
+        &mut idempotency,
+    )?;
+    assert_eq!(dispatch.result_class, "succeeded");
+    assert_eq!(dispatch.target_family, "browser");
+    assert_eq!(dispatch.artifact_ref.as_deref(), Some("audio-ref-1"));
+    assert_eq!(host.invoke_count(), 1);
+    assert_no_leak(&json!(dispatch));
+    Ok(())
+}
+
+#[test]
+fn audio_permission_request_returns_granted_permission_state() -> Result<(), String> {
+    let activations = activated_audio();
+    let mut host = FakeHostConnector::new();
+    let mut idempotency = HostConnectorIdempotencyStore::new();
+    let dispatch = require_ok(
+        &permission_command("macos"),
+        &audio_manifest(),
+        &activations,
+        &mut host,
+        &mut idempotency,
+    )?;
+    assert_eq!(dispatch.result_class, "succeeded");
+    assert_eq!(
+        dispatch.operation.as_deref(),
+        Some(AUDIO_PERMISSION_REQUEST_OPERATION)
+    );
+    assert_eq!(
+        dispatch.permission_state,
+        Some(HostConnectorPermissionState::Granted)
+    );
+    assert!(dispatch.artifact_ref.is_none());
+    assert_eq!(host.invoke_count(), 1);
+    assert_no_leak(&json!(dispatch));
+    Ok(())
+}
+
+#[test]
+fn audio_permission_denied_and_unavailable_are_typed_failures() -> Result<(), String> {
+    let activations = activated_audio();
+    let mut host = FakeHostConnector::new();
+    host.set_permission_state(HostConnectorPermissionState::Denied);
+    let mut idempotency = HostConnectorIdempotencyStore::new();
+    let failed = require_err(
+        &permission_command("macos"),
+        &audio_manifest(),
+        &activations,
+        &mut host,
+        &mut idempotency,
+    )?;
+    assert_eq!(failed.error.code, HostConnectorErrorCode::PolicyDenied);
+    assert_eq!(host.invoke_count(), 1);
+
+    let mut host = FakeHostConnector::new();
+    host.set_permission_state(HostConnectorPermissionState::Unavailable);
+    let mut idempotency = HostConnectorIdempotencyStore::new();
+    let failed = require_err(
+        &permission_command("macos"),
+        &audio_manifest(),
+        &activations,
+        &mut host,
+        &mut idempotency,
+    )?;
+    assert_eq!(failed.error.code, HostConnectorErrorCode::Unavailable);
+    assert_eq!(host.invoke_count(), 1);
+    Ok(())
+}
+
+#[test]
+fn audio_permission_prompt_required_succeeds_and_payload_must_be_empty() -> Result<(), String> {
+    assert_eq!(HostConnectorPermissionState::Granted.as_str(), "granted");
+    assert_eq!(HostConnectorPermissionState::Denied.as_str(), "denied");
+    assert_eq!(
+        HostConnectorPermissionState::PromptRequired.as_str(),
+        "prompt_required"
+    );
+    assert_eq!(
+        HostConnectorPermissionState::Unavailable.as_str(),
+        "unavailable"
+    );
+
+    let activations = activated_audio();
+    let mut host = FakeHostConnector::new();
+    host.set_permission_state(HostConnectorPermissionState::PromptRequired);
+    let mut idempotency = HostConnectorIdempotencyStore::new();
+    let dispatch = require_ok(
+        &permission_command("macos"),
+        &audio_manifest(),
+        &activations,
+        &mut host,
+        &mut idempotency,
+    )?;
+    assert_eq!(
+        dispatch.permission_state,
+        Some(HostConnectorPermissionState::PromptRequired)
+    );
+
+    let mut host = FakeHostConnector::new();
+    let mut idempotency = HostConnectorIdempotencyStore::new();
+    let mut bad = permission_command("macos");
+    bad.payload = json!({"gesture": "click"});
+    let failed = require_err(
+        &bad,
+        &audio_manifest(),
+        &activations,
+        &mut host,
+        &mut idempotency,
+    )?;
+    assert_eq!(
+        failed.error.code,
+        HostConnectorErrorCode::InputLimitExceeded
+    );
+    assert_eq!(host.invoke_count(), 0);
+    Ok(())
+}
+
+#[test]
+fn empty_placement_targets_and_missing_permission_state_fail_closed() -> Result<(), String> {
+    let activations = activated_audio();
+    let mut host = FakeHostConnector::new();
+    let mut idempotency = HostConnectorIdempotencyStore::new();
+    let mut manifest = audio_manifest();
+    manifest.connector_bindings[0].placement_targets.clear();
+    let failed = require_err(
+        &audio_command("macos"),
+        &manifest,
+        &activations,
+        &mut host,
+        &mut idempotency,
+    )?;
+    assert_eq!(
+        failed.error.code,
+        HostConnectorErrorCode::TargetIncompatible
+    );
+    assert_eq!(host.invoke_count(), 0);
+
+    let mut host = FakeHostConnector::new();
+    host.clear_permission_state();
+    let mut idempotency = HostConnectorIdempotencyStore::new();
+    let failed = require_err(
+        &permission_command("macos"),
+        &audio_manifest(),
+        &activations,
+        &mut host,
+        &mut idempotency,
+    )?;
+    assert_eq!(failed.error.code, HostConnectorErrorCode::Unavailable);
+
+    let mut host = FakeHostConnector::new();
+    host.set_empty_artifact(true);
+    let mut idempotency = HostConnectorIdempotencyStore::new();
+    let failed = require_err(
+        &audio_command("macos"),
+        &audio_manifest(),
+        &activations,
+        &mut host,
+        &mut idempotency,
+    )?;
+    assert_eq!(failed.error.code, HostConnectorErrorCode::Unavailable);
     Ok(())
 }
 
