@@ -103,6 +103,23 @@ interface WasmExecutionResult {
   readonly message: string;
 }
 
+/** A host-owned response for one Spec 139 connector wait. */
+export interface HostConnectorAdapterResult {
+  readonly resultClass: "succeeded" | "failed" | "cancelled" | "timeout";
+  readonly payload?: JsonValue;
+}
+
+/**
+ * Browser host authority. It runs outside `runtime.wasm`; the orchestrator
+ * receives only the correlated, typed terminal envelope.
+ */
+export type HostConnectorAdapter = (request: {
+  readonly command: string;
+  readonly commandId: string;
+  readonly sessionId: string;
+  readonly payload: JsonValue;
+}) => Promise<HostConnectorAdapterResult>;
+
 type WorkflowStepStatus = "completed" | "failed";
 
 interface WorkflowStepRecord {
@@ -289,6 +306,9 @@ export class BundleEmbedder implements TraverseEmbedderApi, EmbeddedTraceApi {
   private indexedDbDataStore: IndexedDbDataStore | null = null;
   /** Long-lived Spec 139 app orchestrator instance (process-local sessions). */
   private appHost: RuntimeWasmHost | null = null;
+  /** Host-owned monotonic deadline handles for outstanding Spec 139 waits. */
+  private readonly appDeadlineTimers = new Set<ReturnType<typeof setTimeout>>();
+  private readonly hostConnectorAdapters = new Map<string, HostConnectorAdapter>();
 
   private constructor(
     core: EmbedderCore,
@@ -675,19 +695,125 @@ export class BundleEmbedder implements TraverseEmbedderApi, EmbeddedTraceApi {
     } catch {
       drained = [];
     }
-    for (const event of drained) {
-      if (typeof event !== "object" || event === null || Array.isArray(event)) {
-        continue;
-      }
-      const rawType = typeof event.type === "string" ? event.type : "error";
-      const eventType = mapAppLifecycleEventType(rawType);
-      const eventSession =
-        typeof event.session_id === "string" ? event.session_id : sessionId;
-      const data = (event.data ?? {}) as JsonValue;
-      this.core.emit(eventType, eventSession, data);
-    }
+    this.emitAppEvents(drained, sessionId);
+    this.registerAppDeadlines(host, responseRecord);
+    this.dispatchPendingHostConnector(host, responseRecord, sessionId);
 
     return { sessionId, status: "accepted", error: null };
+  }
+
+  /**
+   * Registers a target-neutral host authority by its manifest command name.
+   * The returned disposer prevents an old page integration retaining authority
+   * after it has been replaced.
+   */
+  registerHostConnectorAdapter(command: string, adapter: HostConnectorAdapter): () => void {
+    if (command.trim() === "") throw new TypeError("host connector command must be non-empty");
+    this.hostConnectorAdapters.set(command, adapter);
+    return () => {
+      if (this.hostConnectorAdapters.get(command) === adapter) {
+        this.hostConnectorAdapters.delete(command);
+      }
+    };
+  }
+
+  private dispatchPendingHostConnector(
+    host: RuntimeWasmHost,
+    response: { readonly [key: string]: RuntimeWasmJson } | null,
+    fallbackSessionId: string,
+  ): void {
+    const pending = response?.pending_host_connector;
+    if (!Array.isArray(pending)) return;
+    for (const item of pending) {
+      if (item === null || typeof item !== "object" || Array.isArray(item)) continue;
+      const command = typeof item.command === "string" ? item.command : null;
+      const commandId = typeof item.command_id === "string" ? item.command_id : null;
+      const sessionId = typeof item.session_id === "string" ? item.session_id : fallbackSessionId;
+      const adapter = command === null ? undefined : this.hostConnectorAdapters.get(command);
+      if (commandId === null) continue;
+      if (command === null || adapter === undefined) {
+        this.completeHostConnector(host, commandId, sessionId, {
+          resultClass: "failed",
+          payload: { code: "target_incompatible" },
+        });
+        continue;
+      }
+      const payload = (item.payload ?? {}) as JsonValue;
+      void adapter({ command, commandId, sessionId, payload })
+        .then((result) => this.completeHostConnector(host, commandId, sessionId, result))
+        .catch(() => this.completeHostConnector(host, commandId, sessionId, {
+          resultClass: "failed",
+          payload: { code: "execution_failed" },
+        }));
+    }
+  }
+
+  private completeHostConnector(
+    host: RuntimeWasmHost,
+    commandId: string,
+    sessionId: string,
+    result: HostConnectorAdapterResult,
+  ): void {
+    if (this.core.stopped || this.appHost !== host) return;
+    try {
+      host.submit(new TextEncoder().encode(JSON.stringify({
+        kind: "host_connector_result",
+        command_id: commandId,
+        session_id: sessionId,
+        result_class: result.resultClass,
+        payload: result.payload ?? {},
+      })));
+      this.emitAppEvents(host.drainEvents(), sessionId);
+    } catch {
+      // Shutdown and first-terminal-wins are runtime-owned; no UI retry path.
+    }
+  }
+
+  /**
+   * Registers the host-side half of Spec 139's dual deadline. The timer is
+   * deliberately outside runtime.wasm: browser clocks are host authority;
+   * runtime.wasm only receives the correlated terminal envelope.
+   */
+  private registerAppDeadlines(
+    host: RuntimeWasmHost,
+    response: { readonly [key: string]: RuntimeWasmJson } | null,
+  ): void {
+    const deadlines = response?.pending_deadlines;
+    if (!Array.isArray(deadlines)) return;
+    for (const deadline of deadlines) {
+      if (deadline === null || typeof deadline !== "object" || Array.isArray(deadline)) continue;
+      const commandId = typeof deadline.command_id === "string" ? deadline.command_id : null;
+      const sessionId = typeof deadline.session_id === "string" ? deadline.session_id : null;
+      const delayMs = typeof deadline.deadline_ms === "number" ? deadline.deadline_ms : null;
+      if (commandId === null || sessionId === null || delayMs === null || !Number.isFinite(delayMs)) {
+        continue;
+      }
+      const timer = setTimeout(() => {
+        this.appDeadlineTimers.delete(timer);
+        if (this.core.stopped || this.appHost !== host) return;
+        try {
+          host.submit(new TextEncoder().encode(JSON.stringify({
+            kind: "deadline_fired",
+            command_id: commandId,
+            session_id: sessionId,
+          })));
+          this.emitAppEvents(host.drainEvents(), sessionId);
+        } catch {
+          // A stopped/replaced runtime cannot accept a terminal; shutdown is
+          // authoritative and no UI-owned recovery path is introduced.
+        }
+      }, Math.max(0, delayMs));
+      this.appDeadlineTimers.add(timer);
+    }
+  }
+
+  private emitAppEvents(events: readonly RuntimeWasmJson[], fallbackSessionId: string): void {
+    for (const event of events) {
+      if (typeof event !== "object" || event === null || Array.isArray(event)) continue;
+      const rawType = typeof event.type === "string" ? event.type : "error";
+      const eventSession = typeof event.session_id === "string" ? event.session_id : fallbackSessionId;
+      this.core.emit(mapAppLifecycleEventType(rawType), eventSession, (event.data ?? {}) as JsonValue);
+    }
   }
 
   private ensureAppHost(): RuntimeWasmHost {
@@ -984,6 +1110,8 @@ export class BundleEmbedder implements TraverseEmbedderApi, EmbeddedTraceApi {
   }
 
   shutdown(): ShutdownOutcome {
+    for (const timer of this.appDeadlineTimers) clearTimeout(timer);
+    this.appDeadlineTimers.clear();
     if (this.appHost !== null) {
       try {
         this.appHost.shutdown();
